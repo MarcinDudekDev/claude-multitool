@@ -1,0 +1,369 @@
+#!/bin/bash
+# img-optimize.sh - Local TinyPNG alternative
+# Optimizes PNG, JPEG, WebP with lossless default
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Defaults
+QUALITY=85
+LOSSY=false
+WEBP=false
+REPLACE=false
+RECURSIVE=false
+VERBOSE=false
+MAX_DIMENSION=4000
+
+usage() {
+    cat << EOF
+Usage: img-optimize.sh [OPTIONS] <file|directory>
+
+Local TinyPNG alternative - optimizes PNG, JPEG, WebP
+
+By default: LOSSLESS optimization. Use --lossy for aggressive compression.
+Auto-resizes images larger than ${MAX_DIMENSION}px.
+
+OPTIONS:
+    -l, --lossy          Enable lossy compression (more aggressive)
+    -q, --quality NUM    Quality for lossy mode 1-100 (default: 85)
+    -m, --max-dim NUM    Max dimension before resize (default: 4000)
+    -w, --webp           Also generate WebP versions
+    -r, --replace        Replace originals (default: creates .opt.ext)
+    -R, --recursive      Process directories recursively
+    -v, --verbose        Show detailed output
+    -h, --help           Show this help
+
+EXAMPLES:
+    img-optimize.sh image.png              # Lossless optimization
+    img-optimize.sh -l image.png           # Lossy (TinyPNG-style)
+    img-optimize.sh -l -q 70 -w images/    # Lossy + WebP
+    img-optimize.sh -r -R ./assets/        # Replace, recursive
+
+REQUIREMENTS:
+    brew install pngquant oxipng jpegoptim webp imagemagick
+
+EOF
+    exit 0
+}
+
+check_deps() {
+    local missing=()
+    command -v oxipng &>/dev/null || missing+=("oxipng")
+    command -v pngquant &>/dev/null || missing+=("pngquant")
+    command -v jpegoptim &>/dev/null || missing+=("jpegoptim")
+    command -v cwebp &>/dev/null || missing+=("webp")
+    command -v magick &>/dev/null || command -v convert &>/dev/null || missing+=("imagemagick")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}Missing tools: ${missing[*]}${NC}"
+        echo -e "Install with: ${BLUE}brew install ${missing[*]}${NC}"
+        echo ""
+    fi
+}
+
+get_size() {
+    stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
+}
+
+human_size() {
+    local bytes=$1
+    if [ $bytes -ge 1048576 ]; then
+        echo "$(echo "scale=1; $bytes/1048576" | bc)MB"
+    elif [ $bytes -ge 1024 ]; then
+        echo "$(echo "scale=1; $bytes/1024" | bc)KB"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+get_dimensions() {
+    local file="$1"
+    if command -v magick &>/dev/null; then
+        magick identify -format "%w %h" "$file" 2>/dev/null | head -1
+    elif command -v identify &>/dev/null; then
+        identify -format "%w %h" "$file" 2>/dev/null | head -1
+    elif command -v sips &>/dev/null; then
+        local w=$(sips -g pixelWidth "$file" 2>/dev/null | tail -1 | awk '{print $2}')
+        local h=$(sips -g pixelHeight "$file" 2>/dev/null | tail -1 | awk '{print $2}')
+        echo "$w $h"
+    else
+        echo "0 0"
+    fi
+}
+
+resize_if_needed() {
+    local input="$1"
+    local output="$2"
+    local dims=$(get_dimensions "$input")
+    local width=$(echo "$dims" | cut -d' ' -f1)
+    local height=$(echo "$dims" | cut -d' ' -f2)
+
+    if [ "$width" -gt "$MAX_DIMENSION" ] || [ "$height" -gt "$MAX_DIMENSION" ]; then
+        echo -e "  ${YELLOW}Resizing: ${width}x${height} → max ${MAX_DIMENSION}px${NC}"
+        if command -v magick &>/dev/null; then
+            magick "$input" -resize "${MAX_DIMENSION}x${MAX_DIMENSION}>" -quality 100 "$output"
+        elif command -v convert &>/dev/null; then
+            convert "$input" -resize "${MAX_DIMENSION}x${MAX_DIMENSION}>" -quality 100 "$output"
+        elif command -v sips &>/dev/null; then
+            cp "$input" "$output"
+            sips --resampleHeightWidthMax "$MAX_DIMENSION" "$output" >/dev/null 2>&1
+        else
+            cp "$input" "$output"
+        fi
+        return 0
+    else
+        cp "$input" "$output"
+        return 1
+    fi
+}
+
+optimize_png() {
+    local input="$1"
+    local output="$2"
+    local before=$(get_size "$input")
+    local temp_dir=$(mktemp -d)
+    local temp_file="$temp_dir/img.png"
+
+    # Resize if needed (ignore return code)
+    resize_if_needed "$input" "$temp_file" || true
+
+    if [ "$LOSSY" = true ]; then
+        # Lossy: pngquant (quantization) -> oxipng (polish)
+        if command -v pngquant &>/dev/null; then
+            pngquant --quality=65-$QUALITY --speed 1 --force --output "$output" "$temp_file" 2>/dev/null || cp "$temp_file" "$output"
+            if command -v oxipng &>/dev/null; then
+                oxipng -o 4 -q "$output" 2>/dev/null || true
+            fi
+        else
+            cp "$temp_file" "$output"
+        fi
+    else
+        # Lossless: oxipng only
+        if command -v oxipng &>/dev/null; then
+            oxipng -o 4 -q --out "$output" "$temp_file" 2>/dev/null || cp "$temp_file" "$output"
+        elif command -v optipng &>/dev/null; then
+            cp "$temp_file" "$output"
+            optipng -o5 -quiet "$output" 2>/dev/null || true
+        else
+            cp "$temp_file" "$output"
+        fi
+    fi
+
+    rm -rf "$temp_dir"
+    local after=$(get_size "$output")
+    print_result "$input" "$before" "$after"
+}
+
+optimize_jpeg() {
+    local input="$1"
+    local output="$2"
+    local before=$(get_size "$input")
+    local temp_dir=$(mktemp -d)
+    local temp_file="$temp_dir/img.jpg"
+
+    # Resize if needed (ignore return code)
+    resize_if_needed "$input" "$temp_file" || true
+
+    if [ "$LOSSY" = true ]; then
+        # Lossy compression
+        if command -v jpegoptim &>/dev/null; then
+            cp "$temp_file" "$output"
+            jpegoptim --max=$QUALITY --strip-all --quiet "$output" 2>/dev/null || true
+        elif command -v cjpeg &>/dev/null && command -v djpeg &>/dev/null; then
+            djpeg "$temp_file" 2>/dev/null | cjpeg -quality $QUALITY -optimize -progressive > "$output" 2>/dev/null || cp "$temp_file" "$output"
+        else
+            cp "$temp_file" "$output"
+        fi
+    else
+        # Lossless: strip metadata, optimize huffman tables
+        if command -v jpegoptim &>/dev/null; then
+            cp "$temp_file" "$output"
+            jpegoptim --strip-all --quiet "$output" 2>/dev/null || true
+        elif command -v jpegtran &>/dev/null; then
+            jpegtran -copy none -optimize -progressive "$temp_file" > "$output" 2>/dev/null || cp "$temp_file" "$output"
+        else
+            cp "$temp_file" "$output"
+        fi
+    fi
+
+    rm -rf "$temp_dir"
+    local after=$(get_size "$output")
+    print_result "$input" "$before" "$after"
+}
+
+optimize_webp() {
+    local input="$1"
+    local output="$2"
+    local before=$(get_size "$input")
+
+    # Resize if needed (convert to png first for resize)
+    local dims=$(get_dimensions "$input")
+    local width=$(echo "$dims" | cut -d' ' -f1)
+    local height=$(echo "$dims" | cut -d' ' -f2)
+
+    if [ "$width" -gt "$MAX_DIMENSION" ] || [ "$height" -gt "$MAX_DIMENSION" ]; then
+        echo -e "  ${YELLOW}Resizing: ${width}x${height} → max ${MAX_DIMENSION}px${NC}"
+        local temp_dir=$(mktemp -d)
+        local png_temp="$temp_dir/img.png"
+        dwebp "$input" -o "$png_temp" 2>/dev/null
+        if command -v magick &>/dev/null; then
+            magick "$png_temp" -resize "${MAX_DIMENSION}x${MAX_DIMENSION}>" "$png_temp"
+        elif command -v sips &>/dev/null; then
+            sips --resampleHeightWidthMax "$MAX_DIMENSION" "$png_temp" >/dev/null 2>&1
+        fi
+        if [ "$LOSSY" = true ]; then
+            cwebp -q $QUALITY -m 6 -quiet "$png_temp" -o "$output" 2>/dev/null
+        else
+            cwebp -lossless -m 6 -quiet "$png_temp" -o "$output" 2>/dev/null
+        fi
+        rm -rf "$temp_dir"
+    else
+        if [ "$LOSSY" = true ]; then
+            cwebp -q $QUALITY -m 6 -quiet "$input" -o "$output" 2>/dev/null
+        else
+            cwebp -lossless -m 6 -quiet "$input" -o "$output" 2>/dev/null
+        fi
+    fi
+
+    local after=$(get_size "$output")
+    print_result "$input" "$before" "$after"
+}
+
+create_webp() {
+    local input="$1"
+    local output="${input%.*}.webp"
+
+    if [ "$REPLACE" = false ]; then
+        output="${input%.*}.opt.webp"
+    fi
+
+    if command -v cwebp &>/dev/null; then
+        if [ "$LOSSY" = true ]; then
+            cwebp -q $QUALITY -m 6 -quiet "$input" -o "$output" 2>/dev/null
+        else
+            cwebp -lossless -m 6 -quiet "$input" -o "$output" 2>/dev/null
+        fi
+        local after=$(get_size "$output")
+        echo -e "  ${BLUE}→ WebP:${NC} $(human_size $after)"
+    fi
+}
+
+print_result() {
+    local file="$1"
+    local before="$2"
+    local after="$3"
+    local saved=$((before - after))
+    local pct=0
+
+    if [ $before -gt 0 ]; then
+        pct=$(echo "scale=1; ($saved * 100) / $before" | bc)
+    fi
+
+    local color=$GREEN
+    if [ $(echo "$pct < 10" | bc) -eq 1 ]; then
+        color=$YELLOW
+    fi
+    if [ $(echo "$pct < 0" | bc) -eq 1 ]; then
+        color=$RED
+    fi
+
+    local mode="lossless"
+    [ "$LOSSY" = true ] && mode="lossy"
+
+    echo -e "${color}✓${NC} $(basename "$file") [$mode]: $(human_size $before) → $(human_size $after) ${color}(-${pct}%)${NC}"
+}
+
+process_file() {
+    local input="$1"
+    # Make path absolute
+    [[ "$input" != /* ]] && input="$(pwd)/$input"
+
+    local ext="${input##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+    local output="$input"
+    if [ "$REPLACE" = false ]; then
+        output="${input%.*}.opt.${ext}"
+    fi
+
+    case "$ext" in
+        png)
+            optimize_png "$input" "$output"
+            [ "$WEBP" = true ] && create_webp "$output"
+            ;;
+        jpg|jpeg)
+            optimize_jpeg "$input" "$output"
+            [ "$WEBP" = true ] && create_webp "$output"
+            ;;
+        webp)
+            optimize_webp "$input" "$output"
+            ;;
+        *)
+            [ "$VERBOSE" = true ] && echo -e "${YELLOW}Skipping: $input${NC}"
+            return
+            ;;
+    esac
+
+    # If replacing and we used a different output path
+    if [ "$REPLACE" = true ] && [ "$output" != "$input" ]; then
+        mv "$output" "$input"
+    fi
+}
+
+process_directory() {
+    local dir="$1"
+    local find_opts="-maxdepth 1"
+
+    [ "$RECURSIVE" = true ] && find_opts=""
+
+    find "$dir" $find_opts -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.webp" \) 2>/dev/null | while read -r file; do
+        process_file "$file"
+    done
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -l|--lossy) LOSSY=true; shift ;;
+        -q|--quality) QUALITY="$2"; shift 2 ;;
+        -m|--max-dim) MAX_DIMENSION="$2"; shift 2 ;;
+        -w|--webp) WEBP=true; shift ;;
+        -r|--replace) REPLACE=true; shift ;;
+        -R|--recursive) RECURSIVE=true; shift ;;
+        -v|--verbose) VERBOSE=true; shift ;;
+        -h|--help) usage ;;
+        -*) echo "Unknown option: $1"; usage ;;
+        *) break ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+MODE="LOSSLESS"
+[ "$LOSSY" = true ] && MODE="LOSSY (q=$QUALITY)"
+
+echo -e "${BLUE}img-optimize${NC} - Mode: $MODE | Max: ${MAX_DIMENSION}px"
+echo ""
+
+check_deps
+
+for target in "$@"; do
+    if [ -d "$target" ]; then
+        process_directory "$target"
+    elif [ -f "$target" ]; then
+        process_file "$target"
+    else
+        echo -e "${RED}Not found: $target${NC}"
+    fi
+done
+
+echo ""
+echo -e "${GREEN}Done!${NC}"

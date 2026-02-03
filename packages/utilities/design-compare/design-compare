@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+design-compare - Compare design mockups with implementation screenshots
+
+Usage:
+    design-compare <design> <test> [options]
+
+Options:
+    --output, -o FILE      Save diff heatmap to FILE
+    --side-by-side FILE    Save side-by-side comparison (design | test | heatmap)
+    --json                 Output JSON to stdout
+    --threshold N          Pass threshold percentage (default: 90)
+    --no-clip              Skip CLIP embeddings (faster)
+    --weights W            Custom weights: "ssim:0.3,phash:0.2,clip:0.35,pixel_match:0.15"
+    --quiet                Only output combined score
+    --open                 Auto-open comparison image after generation (macOS)
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# Default weights
+DEFAULT_WEIGHTS = {
+    'ssim': 0.30,
+    'phash': 0.20,
+    'clip': 0.35,
+    'pixel_match': 0.15
+}
+
+# Fallback weights when CLIP unavailable
+FALLBACK_WEIGHTS = {
+    'ssim': 0.45,
+    'phash': 0.35,
+    'clip': 0.0,
+    'pixel_match': 0.20
+}
+
+
+def load_and_resize(design_path: str, test_path: str) -> Tuple[Image.Image, Image.Image, dict]:
+    """Load both images and resize test to match design dimensions."""
+    design = Image.open(design_path).convert('RGB')
+    test = Image.open(test_path).convert('RGB')
+
+    dimensions = {
+        'design': list(design.size),
+        'test': list(test.size),
+        'compared_at': list(design.size)
+    }
+
+    # Resize test to match design dimensions
+    if test.size != design.size:
+        test = test.resize(design.size, Image.Resampling.LANCZOS)
+
+    return design, test, dimensions
+
+
+def calculate_ssim(design: Image.Image, test: Image.Image) -> Tuple[float, np.ndarray]:
+    """Calculate SSIM (Structural Similarity Index) and return diff map."""
+    try:
+        from skimage.metrics import structural_similarity
+
+        # Convert to grayscale numpy arrays for SSIM
+        design_gray = np.array(design.convert('L'))
+        test_gray = np.array(test.convert('L'))
+
+        # Calculate SSIM with full diff image
+        score, diff = structural_similarity(design_gray, test_gray, full=True)
+
+        return score * 100, diff
+    except ImportError:
+        print("Warning: scikit-image not installed. SSIM unavailable.", file=sys.stderr)
+        print("Install with: pip install scikit-image", file=sys.stderr)
+        return 0.0, None
+
+
+def calculate_phash(design: Image.Image, test: Image.Image) -> float:
+    """Calculate perceptual hash similarity."""
+    try:
+        import imagehash
+
+        hash1 = imagehash.phash(design, hash_size=16)
+        hash2 = imagehash.phash(test, hash_size=16)
+
+        # Calculate similarity (lower difference = higher similarity)
+        max_diff = 16 * 16  # Maximum possible difference
+        diff = hash1 - hash2
+        similarity = ((max_diff - diff) / max_diff) * 100
+
+        return similarity
+    except ImportError:
+        print("Warning: imagehash not installed. pHash unavailable.", file=sys.stderr)
+        print("Install with: pip install imagehash", file=sys.stderr)
+        return 0.0
+
+
+def calculate_clip_similarity(design: Image.Image, test: Image.Image) -> float:
+    """Calculate CLIP embedding cosine similarity."""
+    try:
+        from transformers import CLIPProcessor, CLIPModel
+        import torch
+
+        model_name = "openai/clip-vit-base-patch32"
+        model = CLIPModel.from_pretrained(model_name)
+        processor = CLIPProcessor.from_pretrained(model_name)
+
+        # Process both images
+        inputs1 = processor(images=design, return_tensors="pt")
+        inputs2 = processor(images=test, return_tensors="pt")
+
+        with torch.no_grad():
+            features1 = model.get_image_features(**inputs1)
+            features2 = model.get_image_features(**inputs2)
+
+        # Normalize and calculate cosine similarity
+        features1 = features1 / features1.norm(dim=-1, keepdim=True)
+        features2 = features2 / features2.norm(dim=-1, keepdim=True)
+
+        similarity = torch.matmul(features1, features2.T).item()
+
+        # Convert to percentage (CLIP similarity is already 0-1)
+        return similarity * 100
+    except ImportError:
+        print("Warning: transformers not installed. CLIP unavailable.", file=sys.stderr)
+        print("Install with: pip install transformers torch", file=sys.stderr)
+        return None  # Signal that CLIP is unavailable
+    except Exception as e:
+        print(f"Warning: CLIP failed: {e}", file=sys.stderr)
+        return None
+
+
+def calculate_pixel_match(design: Image.Image, test: Image.Image, threshold: int = 10) -> float:
+    """Calculate percentage of pixels that match within threshold."""
+    design_arr = np.array(design)
+    test_arr = np.array(test)
+
+    # Calculate absolute difference
+    diff = np.abs(design_arr.astype(np.int16) - test_arr.astype(np.int16))
+
+    # Count pixels where all channels are within threshold
+    matching = np.all(diff <= threshold, axis=2)
+    match_percentage = (np.sum(matching) / matching.size) * 100
+
+    return match_percentage
+
+
+def generate_heatmap(ssim_diff: np.ndarray) -> Image.Image:
+    """Convert SSIM diff map to a visual heatmap."""
+    if ssim_diff is None:
+        return None
+
+    # Normalize diff to 0-255 range (invert so differences are bright)
+    diff_normalized = ((1 - ssim_diff) * 255).astype(np.uint8)
+
+    # Create RGB heatmap (red = different, blue = same)
+    height, width = diff_normalized.shape
+    heatmap = np.zeros((height, width, 3), dtype=np.uint8)
+
+    # Red channel shows differences
+    heatmap[:, :, 0] = diff_normalized
+    # Blue channel shows similarities
+    heatmap[:, :, 2] = 255 - diff_normalized
+
+    return Image.fromarray(heatmap)
+
+
+def create_side_by_side(design: Image.Image, test: Image.Image, heatmap: Optional[Image.Image],
+                        scores: dict, weights: dict, threshold: float) -> Image.Image:
+    """Create side-by-side comparison image with annotations."""
+    width, height = design.size
+    padding = 20
+    label_height = 40
+    footer_height = 80
+
+    # Total dimensions
+    total_width = (width * 3) + (padding * 4)
+    total_height = height + label_height + footer_height + (padding * 3)
+
+    # Create canvas
+    canvas = Image.new('RGB', (total_width, total_height), (30, 30, 30))
+    draw = ImageDraw.Draw(canvas)
+
+    # Try to load a font, fall back to default
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
+        font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+    except:
+        font = ImageFont.load_default()
+        font_small = font
+
+    # Place images
+    x_positions = [padding, width + padding * 2, width * 2 + padding * 3]
+    labels = ['DESIGN', 'TEST', 'HEATMAP']
+
+    for i, (x, label, img) in enumerate(zip(x_positions, labels, [design, test, heatmap])):
+        # Draw label
+        draw.text((x + width // 2 - 30, padding), label, fill=(200, 200, 200), font=font)
+
+        # Place image
+        if img:
+            canvas.paste(img, (x, label_height + padding))
+
+    # Draw scores footer
+    y_footer = height + label_height + padding * 2
+
+    combined = scores.get('combined', 0)
+    passed = combined >= threshold
+    status_text = "✓ PASS" if passed else "✗ FAIL"
+    status_color = (100, 200, 100) if passed else (200, 100, 100)
+
+    # Score line
+    score_parts = []
+    if 'ssim' in scores and scores['ssim'] > 0:
+        score_parts.append(f"SSIM: {scores['ssim']:.1f}%")
+    if 'phash' in scores and scores['phash'] > 0:
+        score_parts.append(f"pHash: {scores['phash']:.1f}%")
+    if 'clip' in scores and scores['clip'] is not None and scores['clip'] > 0:
+        score_parts.append(f"CLIP: {scores['clip']:.1f}%")
+    if 'pixel_match' in scores:
+        score_parts.append(f"Pixel: {scores['pixel_match']:.1f}%")
+
+    score_text = "  |  ".join(score_parts)
+    draw.text((padding, y_footer), score_text, fill=(180, 180, 180), font=font_small)
+
+    # Combined score and status
+    combined_text = f"Combined: {combined:.1f}%  {status_text} (threshold {threshold:.0f}%)"
+    draw.text((padding, y_footer + 30), combined_text, fill=status_color, font=font)
+
+    return canvas
+
+
+def parse_weights(weights_str: str) -> dict:
+    """Parse weight string like 'ssim:0.3,phash:0.2,clip:0.35,pixel:0.15'"""
+    weights = DEFAULT_WEIGHTS.copy()
+    if not weights_str:
+        return weights
+
+    for pair in weights_str.split(','):
+        if ':' in pair:
+            key, value = pair.split(':')
+            key = key.strip().lower()
+            if key in weights:
+                weights[key] = float(value)
+
+    return weights
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compare design mockups with implementation screenshots',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    parser.add_argument('design', help='Path to design mockup image')
+    parser.add_argument('test', help='Path to test/screenshot image')
+    parser.add_argument('-o', '--output', help='Save diff heatmap to file')
+    parser.add_argument('--side-by-side', dest='side_by_side', help='Save side-by-side comparison')
+    parser.add_argument('--json', action='store_true', help='Output JSON to stdout')
+    parser.add_argument('--threshold', type=float, default=90, help='Pass threshold (default: 90)')
+    parser.add_argument('--no-clip', action='store_true', help='Skip CLIP embeddings')
+    parser.add_argument('--weights', help='Custom weights: "ssim:0.3,phash:0.2,clip:0.35,pixel_match:0.15"')
+    parser.add_argument('--quiet', action='store_true', help='Only output combined score')
+    parser.add_argument('--open', action='store_true', help='Auto-open comparison image (macOS)')
+
+    args = parser.parse_args()
+
+    # Validate input files
+    if not os.path.exists(args.design):
+        print(f"Error: Design file not found: {args.design}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(args.test):
+        print(f"Error: Test file not found: {args.test}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load and resize images
+    design, test, dimensions = load_and_resize(args.design, args.test)
+
+    # Parse weights
+    weights = parse_weights(args.weights)
+
+    # Calculate metrics
+    scores = {}
+    ssim_diff = None
+
+    # SSIM
+    scores['ssim'], ssim_diff = calculate_ssim(design, test)
+
+    # pHash
+    scores['phash'] = calculate_phash(design, test)
+
+    # CLIP (unless disabled)
+    clip_available = True
+    if not args.no_clip:
+        clip_score = calculate_clip_similarity(design, test)
+        if clip_score is None:
+            clip_available = False
+            scores['clip'] = None
+        else:
+            scores['clip'] = clip_score
+    else:
+        clip_available = False
+        scores['clip'] = None
+
+    # Pixel match
+    scores['pixel_match'] = calculate_pixel_match(design, test)
+
+    # Use fallback weights if CLIP unavailable
+    if not clip_available:
+        weights = FALLBACK_WEIGHTS.copy()
+
+    # Calculate combined score
+    combined = 0.0
+    for metric, weight in weights.items():
+        if metric in scores and scores[metric] is not None and weight > 0:
+            combined += scores[metric] * weight
+
+    scores['combined'] = combined
+    passed = combined >= args.threshold
+
+    # Generate heatmap
+    heatmap = generate_heatmap(ssim_diff)
+
+    # Save heatmap - either to specified path or auto-generate temp path
+    heatmap_path = None
+    if heatmap:
+        if args.output:
+            heatmap_path = args.output
+        else:
+            # Auto-generate temp path for heatmap
+            heatmap_path = '/tmp/design-compare-heatmap.png'
+        heatmap.save(heatmap_path)
+
+    # Generate side-by-side if requested (or if --open without explicit file)
+    side_by_side_path = args.side_by_side
+    if args.open and not side_by_side_path:
+        # Generate temp path for auto-open
+        side_by_side_path = '/tmp/design-compare-output.png'
+
+    if side_by_side_path:
+        comparison = create_side_by_side(design, test, heatmap, scores, weights, args.threshold)
+        comparison.save(side_by_side_path)
+
+    # Auto-open on macOS
+    if args.open and side_by_side_path:
+        subprocess.run(['open', side_by_side_path], check=False)
+
+    # Output results
+    if args.json:
+        result = {
+            'design': args.design,
+            'test': args.test,
+            'dimensions': dimensions,
+            'similarity': {
+                'ssim': round(scores['ssim'], 1),
+                'phash': round(scores['phash'], 1),
+                'clip': round(scores['clip'], 1) if scores['clip'] else None,
+                'pixel_match': round(scores['pixel_match'], 1),
+                'combined': round(combined, 1)
+            },
+            'weights': weights,
+            'threshold': args.threshold,
+            'pass': bool(passed),
+            'diff_image': heatmap_path,
+            'side_by_side': side_by_side_path
+        }
+        print(json.dumps(result, indent=2))
+    elif args.quiet:
+        print(f"{combined:.1f}")
+    else:
+        # Human-readable output
+        print(f"\n{'=' * 50}")
+        print(f"Design: {args.design}")
+        print(f"Test:   {args.test}")
+        print(f"{'=' * 50}")
+        print(f"SSIM:        {scores['ssim']:6.1f}%")
+        print(f"pHash:       {scores['phash']:6.1f}%")
+        if scores['clip'] is not None:
+            print(f"CLIP:        {scores['clip']:6.1f}%")
+        else:
+            print(f"CLIP:        (unavailable)")
+        print(f"Pixel Match: {scores['pixel_match']:6.1f}%")
+        print(f"{'=' * 50}")
+        print(f"Combined:    {combined:6.1f}%")
+        print(f"Threshold:   {args.threshold:6.1f}%")
+        print(f"Status:      {'PASS ✓' if passed else 'FAIL ✗'}")
+        print(f"{'=' * 50}\n")
+
+        if heatmap_path:
+            print(f"Heatmap saved to: {heatmap_path}")
+        if side_by_side_path:
+            print(f"Comparison saved to: {side_by_side_path}")
+
+    # Exit with 0 on successful execution (pass/fail status is in output)
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
