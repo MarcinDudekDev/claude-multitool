@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Interactive tool selector.
+Usage:
+  t              # Interactive picker (fzf)
+  t <query>      # Pre-filter list
+  t --list       # Plain list of tools
+  t --refresh    # Rebuild cache
+  t --path NAME  # Output tool path (for scripts)
+  t --help       # Show this help
+
+Arguments after -- are passed to the selected tool:
+  t browser -- --url http://localhost
+
+Shell function (add to .zshrc):
+  t() { command t "$@"; }
+"""
+
+import ast
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Configuration - can be overridden via environment variables
+TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", Path.home() / "Tools"))
+CACHE_PATH = Path(os.environ.get("T_CACHE", Path.home() / ".cache" / "t-tools.json"))
+SELF_NAME = "t"
+
+# Extensions to exclude (data files, not tools)
+EXCLUDE_EXTENSIONS = {'.json', '.html', '.md', '.txt', '.js', '.css', '.php',
+                      '.backup', '.bak', '.pyc', '.log', '.png', '.jpg', '.gif'}
+
+# Directories to skip (common non-tool directories)
+EXCLUDE_DIRS = {'__pycache__', '.git', '.claude', 'screenshots', 'tests', 'docs', 'data',
+                'node_modules', '.venv', 'venv', 'archive'}
+
+
+def is_excluded(path: Path) -> bool:
+    """Fast exclusion check - no file reads."""
+    name = path.name
+
+    # Self-exclusion
+    if name == SELF_NAME:
+        return True
+
+    # Directory exclusion
+    if path.is_dir():
+        return True
+
+    # Extension-based exclusion
+    suffix = path.suffix.lower()
+    if suffix in EXCLUDE_EXTENSIONS:
+        return True
+
+    # Hidden files
+    if name.startswith('.'):
+        return True
+
+    return False
+
+
+def has_shebang(path: Path) -> bool:
+    """Check if file has a shebang (even if not executable)."""
+    try:
+        with open(path, 'rb') as f:
+            first_bytes = f.read(2)
+            return first_bytes == b'#!'
+    except (OSError, PermissionError):
+        return False
+
+
+def is_tool(path: Path) -> bool:
+    """Check if path is a valid tool (executable or has shebang)."""
+    if os.access(path, os.X_OK):
+        return True
+    # Check for shebang even if not executable
+    return has_shebang(path)
+
+
+def extract_description(path: Path) -> str:
+    """Extract one-line description from tool."""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except (OSError, PermissionError):
+        return ""
+
+    if not content:
+        return ""
+
+    lines = content.split('\n')[:10]  # First 10 lines for pattern matching
+    first_line = lines[0].strip() if lines else ""
+    name = path.name.replace('.sh', '').replace('.py', '')
+
+    # Pattern 1: Python docstring (check first, most reliable for Python files)
+    if first_line.startswith('#!') and 'python' in first_line.lower():
+        try:
+            tree = ast.parse(content)
+            docstring = ast.get_docstring(tree)
+            if docstring:
+                # Get first non-empty line of docstring
+                for line in docstring.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('Usage'):
+                        return line[:80]
+        except SyntaxError:
+            pass
+
+    # Pattern 2: # <name> - <description>
+    for line in lines[1:6]:
+        line = line.strip()
+        if line.startswith('#') and ' - ' in line:
+            desc = line.lstrip('#').strip()
+            # Check if it starts with the tool name
+            if desc.lower().startswith(name.lower()):
+                return desc.split(' - ', 1)[-1].strip()
+            # Or just return the description part
+            if ' - ' in desc:
+                return desc.split(' - ', 1)[-1].strip()
+
+    # Pattern 3: First comment after shebang
+    for line in lines[1:5]:
+        line = line.strip()
+        if line.startswith('#') and len(line) > 2:
+            desc = line.lstrip('#').strip()
+            if desc and not desc.startswith('!'):
+                return desc[:80]
+
+    return ""
+
+
+def discover_tools() -> dict:
+    """Discover tools in ~/Tools/. Returns {name: {path, description}}."""
+    tools = {}
+    seen_resolved = set()  # Track resolved paths for deduplication
+
+    # List all entries in Tools directory
+    try:
+        entries = list(TOOLS_DIR.iterdir())
+    except OSError:
+        return {}
+
+    for path in entries:
+        # EXCLUDE first (fast, no file reads)
+        if is_excluded(path):
+            continue
+
+        # Skip directories in exclude list
+        if path.name in EXCLUDE_DIRS:
+            continue
+
+        # Resolve symlinks for deduplication
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+
+        # Skip if we've seen this resolved path
+        if resolved in seen_resolved:
+            continue
+        seen_resolved.add(resolved)
+
+        # Check if it's a valid tool
+        if not is_tool(path):
+            continue
+
+        # Extract description
+        description = extract_description(resolved)
+
+        tools[path.name] = {
+            'path': str(path),
+            'description': description,
+            'resolved': str(resolved)
+        }
+
+    return tools
+
+
+def load_cache() -> dict:
+    """Load cached tools if still valid."""
+    if not CACHE_PATH.exists():
+        return None
+
+    try:
+        with open(CACHE_PATH) as f:
+            cache = json.load(f)
+
+        # Check cache validity: dir mtime + file count
+        dir_stat = TOOLS_DIR.stat()
+        file_count = len([e for e in TOOLS_DIR.iterdir() if e.is_file()])
+
+        if (cache.get('dir_mtime') == dir_stat.st_mtime and
+            cache.get('file_count') == file_count):
+            return cache.get('tools', {})
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+
+    return None
+
+
+def save_cache(tools: dict):
+    """Save tools to cache atomically."""
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        dir_stat = TOOLS_DIR.stat()
+        file_count = len([e for e in TOOLS_DIR.iterdir() if e.is_file()])
+    except OSError:
+        return
+
+    cache = {
+        'dir_mtime': dir_stat.st_mtime,
+        'file_count': file_count,
+        'tools': tools
+    }
+
+    # Atomic write: temp file + rename
+    try:
+        fd, temp_path = tempfile.mkstemp(dir=CACHE_PATH.parent)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(cache, f, indent=2)
+        os.rename(temp_path, CACHE_PATH)
+    except OSError:
+        pass
+
+
+def get_tools(force_refresh=False) -> dict:
+    """Get tools, using cache if valid."""
+    if not force_refresh:
+        cached = load_cache()
+        if cached is not None:
+            return cached
+
+    tools = discover_tools()
+    save_cache(tools)
+    return tools
+
+
+def format_for_fzf(tools: dict) -> str:
+    """Format tools for fzf display."""
+    lines = []
+    max_name_len = max(len(name) for name in tools.keys()) if tools else 20
+
+    for name in sorted(tools.keys()):
+        info = tools[name]
+        desc = info.get('description', '')[:60]
+        lines.append(f"{name:<{max_name_len}}  {desc}")
+
+    return '\n'.join(lines)
+
+
+def run_fzf(tools: dict, query: str = None) -> str:
+    """Run fzf and return selected tool name."""
+    fzf_input = format_for_fzf(tools)
+
+    if not fzf_input.strip():
+        print("No tools found. Check ~/Tools/", file=sys.stderr)
+        return None
+
+    cmd = ['fzf', '--height=40%', '--layout=reverse', '--border',
+           '--header=Tools (type to filter, Enter to select)',
+           '--preview-window=hidden']
+
+    if query:
+        cmd.extend(['--query', query])
+
+    try:
+        result = subprocess.run(cmd, input=fzf_input, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()[0]
+    except FileNotFoundError:
+        print("fzf not found. Install: brew install fzf", file=sys.stderr)
+
+    return None
+
+
+def list_tools(tools: dict):
+    """Print plain list of tools."""
+    max_name_len = max(len(name) for name in tools.keys()) if tools else 20
+
+    for name in sorted(tools.keys()):
+        info = tools[name]
+        desc = info.get('description', '')
+        print(f"{name:<{max_name_len}}  {desc}")
+
+
+def get_tool_path(name: str, tools: dict) -> str:
+    """Get path for tool by name (exact or fuzzy match)."""
+    # Exact match
+    if name in tools:
+        return tools[name]['path']
+
+    # Fuzzy match
+    matches = [n for n in tools if name.lower() in n.lower()]
+    if len(matches) == 1:
+        return tools[matches[0]]['path']
+    elif len(matches) > 1:
+        print(f"Ambiguous: {', '.join(matches)}", file=sys.stderr)
+    else:
+        print(f"Tool not found: {name}", file=sys.stderr)
+
+    return None
+
+
+def execute_tool(tool_path: str, args: list):
+    """Execute tool, replacing current process."""
+    try:
+        # Use execvp for clean handoff
+        os.execvp(tool_path, [tool_path] + args)
+    except OSError as e:
+        print(f"Error executing {tool_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Handle flags
+    if '--help' in args or '-h' in args:
+        print(__doc__, file=sys.stderr)
+        return
+
+    if '--refresh' in args:
+        tools = get_tools(force_refresh=True)
+        print(f"Refreshed cache: {len(tools)} tools", file=sys.stderr)
+        return
+
+    if '--list' in args:
+        tools = get_tools()
+        list_tools(tools)
+        return
+
+    if '--path' in args:
+        idx = args.index('--path')
+        if len(args) <= idx + 1:
+            print("Usage: t --path TOOL_NAME", file=sys.stderr)
+            sys.exit(1)
+        name = args[idx + 1]
+        tools = get_tools()
+        path = get_tool_path(name, tools)
+        if path:
+            print(path)
+        else:
+            sys.exit(1)
+        return
+
+    # Check for -- separator (pass remaining args to tool)
+    tool_args = []
+    query = None
+
+    if '--' in args:
+        sep_idx = args.index('--')
+        query = args[0] if sep_idx > 0 else None
+        tool_args = args[sep_idx + 1:]
+    elif args:
+        query = args[0]
+
+    # Get tools and run fzf
+    tools = get_tools()
+
+    if not tools:
+        print("No tools found. Check ~/Tools/", file=sys.stderr)
+        sys.exit(1)
+
+    selected = run_fzf(tools, query)
+
+    if selected and selected in tools:
+        tool_path = tools[selected]['path']
+        execute_tool(tool_path, tool_args)
+
+
+if __name__ == '__main__':
+    main()

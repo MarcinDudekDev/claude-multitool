@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mobile Claude</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100%;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: fixed;
+            width: 100%;
+            top: 0;
+            left: 0;
+        }
+        header {
+            padding: 8px;
+            background: #16213e;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-shrink: 0;
+            z-index: 10;
+        }
+        #session-select {
+            flex: 1;
+            padding: 8px 12px;
+            border: none;
+            border-radius: 6px;
+            background: #0f3460;
+            color: #fff;
+            font-size: 14px;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23fff'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            cursor: pointer;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e94560;
+            flex-shrink: 0;
+        }
+        .status-dot.connected { background: #4ade80; }
+
+        .key-toolbar {
+            padding: 6px 8px;
+            background: #16213e;
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+            border-top: 1px solid #0f3460;
+        }
+        .key-btn {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 6px;
+            background: #0f3460;
+            color: #fff;
+            font-size: 12px;
+            font-family: Menlo, Monaco, monospace;
+            cursor: pointer;
+            min-width: 36px;
+            text-align: center;
+        }
+        .key-btn:active {
+            background: #1a4a8a;
+        }
+
+        #terminal-wrapper {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        #terminal {
+            min-width: 100%;
+            width: max-content;
+        }
+        #terminal .xterm {
+            padding: 4px;
+        }
+        #terminal .xterm-viewport {
+            overflow: hidden !important;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <select id="session-select" onchange="connectToSelected()">
+            <option value="">Loading...</option>
+        </select>
+        <div class="status-dot" id="status-dot"></div>
+    </header>
+    <div class="key-toolbar">
+        <button class="key-btn" onclick="sendKey('\t')">Tab</button>
+        <button class="key-btn" onclick="sendKey('\r')">Enter</button>
+        <button class="key-btn" onclick="sendKey('\x1b')">Esc</button>
+        <button class="key-btn" onclick="sendKey('\x03')">^C</button>
+        <button class="key-btn" onclick="sendKey('\x1b[A')">↑</button>
+        <button class="key-btn" onclick="sendKey('\x1b[B')">↓</button>
+        <button class="key-btn" onclick="sendKey('\x1b[D')">←</button>
+        <button class="key-btn" onclick="sendKey('\x1b[C')">→</button>
+    </div>
+    <div id="terminal-wrapper">
+        <div id="terminal"></div>
+    </div>
+    <!-- Hidden input for mobile keyboard/dictation -->
+    <input type="text" id="mobile-input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+           style="position:absolute;left:-9999px;opacity:0;">
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script>
+        let term, ws;
+        let currentCols = 80;
+        let currentRows = 50;  // Dynamic rows based on content
+        let desktopCols = 80;  // Store actual desktop width
+        let lastSentText = '';  // Track what we've sent for dictation dedup
+        let isComposing = false;
+        let isTypingMode = false;
+        let lastContent = '';  // Preserve content for mode switches
+
+        function sendKey(key) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(key);
+                scrollToBottom();
+            }
+        }
+
+        function initTerminal(cols = 80) {
+            if (term) {
+                term.dispose();
+            }
+
+            currentCols = cols;
+
+            term = new Terminal({
+                fontSize: 11,
+                fontFamily: 'Menlo, Monaco, monospace',
+                theme: { background: '#1a1a2e' },
+                scrollback: 0,
+                convertEol: true,
+                cols: cols,
+                rows: currentRows
+            });
+
+            term.open(document.getElementById('terminal'));
+            term.write('\x1b[?25l');  // Hide cursor (ANSI escape)
+
+            // Handle xterm direct input (for special keys)
+            term.onData(data => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    if (data.match(/^\x1b\[\d+;\d+[tR]/) || data.match(/^\x1b\[[\d;]*[cn]/)) {
+                        return;
+                    }
+                    // Only handle control chars and escape sequences here
+                    // Regular text goes through mobile-input
+                    if (data.length === 1 && data.charCodeAt(0) < 32) {
+                        ws.send(data);
+                        scrollToBottom();
+                    } else if (data.startsWith('\x1b')) {
+                        ws.send(data);
+                        scrollToBottom();
+                    }
+                }
+            });
+
+            // Setup mobile input handler
+            setupMobileInput();
+        }
+
+        function setupMobileInput() {
+            const input = document.getElementById('mobile-input');
+
+            // Single tap on terminal to focus input (keyboard will trigger mode change)
+            document.getElementById('terminal-wrapper').addEventListener('click', () => {
+                if (!isTypingMode) {
+                    input.focus();
+                }
+            });
+
+            // Track composition (dictation) state
+            input.addEventListener('compositionstart', () => {
+                isComposing = true;
+            });
+
+            input.addEventListener('compositionend', () => {
+                isComposing = false;
+                // Longer delay after dictation to let iOS settle
+                setTimeout(flushInput, 200);
+            });
+
+            // Handle regular input - debounce for rapid changes
+            let inputTimeout;
+            input.addEventListener('input', () => {
+                clearTimeout(inputTimeout);
+                if (!isComposing) {
+                    // Debounce to batch rapid changes (typing, backspace, autocorrect)
+                    inputTimeout = setTimeout(flushInput, 150);
+                }
+            });
+
+            // Handle Enter key
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    flushInput();
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send('\r');
+                    }
+                    input.value = '';
+                    lastSentText = '';
+                    scrollToBottom();
+                } else if (e.key === 'Backspace' && input.value === '') {
+                    // Handle backspace when input is empty
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send('\x7f');
+                    }
+                    scrollToBottom();
+                }
+            });
+
+        }
+
+        function flushInput() {
+            const input = document.getElementById('mobile-input');
+            const currentText = input.value;
+
+            if (currentText === lastSentText) return;
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Case 1: Text was appended (normal typing/dictation)
+                if (currentText.startsWith(lastSentText)) {
+                    const delta = currentText.slice(lastSentText.length);
+                    if (delta) ws.send(delta);
+                }
+                // Case 2: Text was shortened (backspace)
+                else if (lastSentText.startsWith(currentText)) {
+                    const deleteCount = lastSentText.length - currentText.length;
+                    for (let i = 0; i < deleteCount; i++) {
+                        ws.send('\x7f');
+                    }
+                }
+                // Case 3: Text changed in middle - find common prefix and fix from there
+                else {
+                    // Find common prefix length
+                    let commonLen = 0;
+                    while (commonLen < currentText.length && commonLen < lastSentText.length &&
+                           currentText[commonLen] === lastSentText[commonLen]) {
+                        commonLen++;
+                    }
+                    // Delete from common point to end of old text
+                    const deleteCount = lastSentText.length - commonLen;
+                    for (let i = 0; i < deleteCount; i++) {
+                        ws.send('\x7f');
+                    }
+                    // Send new suffix
+                    const newSuffix = currentText.slice(commonLen);
+                    if (newSuffix) ws.send(newSuffix);
+                }
+                scrollToBottom();
+            }
+            lastSentText = currentText;
+        }
+
+        function scrollToBottom() {
+            const wrapper = document.getElementById('terminal-wrapper');
+            wrapper.scrollTop = wrapper.scrollHeight;
+        }
+
+        function getMobileCols() {
+            // Calculate cols that fit screen width
+            const charWidth = 6.6;  // Menlo at 11px is ~6.6px per char
+            const screenWidth = window.innerWidth - 8;  // 4px padding each side
+            return Math.floor(screenWidth / charWidth);
+        }
+
+        function getNeededRows(content) {
+            // Count actual content lines
+            const lines = content ? content.split('\n').length : 0;
+            // Get minimum visible rows based on viewport
+            const lineHeight = 15;  // ~15px per line at fontSize 11
+            const wrapper = document.getElementById('terminal-wrapper');
+            const visibleRows = Math.ceil(wrapper.clientHeight / lineHeight);
+            // Use content lines + small buffer, but at least fill visible area
+            return Math.max(lines + 3, visibleRows, 20);
+        }
+
+        function setTypingMode(enabled) {
+            if (isTypingMode === enabled) return;
+            isTypingMode = enabled;
+
+            const targetCols = enabled ? getMobileCols() : desktopCols;
+            if (targetCols !== currentCols && term) {
+                currentCols = targetCols;
+                term.resize(targetCols, currentRows);
+                // Redraw content after resize
+                if (lastContent) {
+                    term.write(lastContent);
+                    scrollToBottom();
+                }
+            }
+        }
+
+        function handleMessage(text) {
+            // Check for resize command: \x1b]RESIZE:cols,rows\x07
+            const resizeMatch = text.match(/\x1b\]RESIZE:(\d+),(\d+)\x07/);
+            if (resizeMatch) {
+                const newCols = parseInt(resizeMatch[1]);
+                desktopCols = newCols;  // Store desktop width
+                // Only resize if not in typing mode
+                if (!isTypingMode && newCols !== currentCols) {
+                    console.log(`Resizing cols to ${newCols}`);
+                    initTerminal(newCols);
+                }
+                // Remove resize command from text
+                text = text.replace(/\x1b\]RESIZE:\d+,\d+\x07/g, '');
+            }
+
+            if (text) {
+                lastContent = text;
+                // Resize rows to match content (no empty space at bottom)
+                const neededRows = getNeededRows(text);
+                if (neededRows !== currentRows) {
+                    currentRows = neededRows;
+                    term.resize(currentCols, currentRows);
+                }
+                term.write(text);
+                scrollToBottom();
+            }
+        }
+
+        function connect(session) {
+            if (ws) ws.close();
+            if (!session) return;
+
+            document.getElementById('status-dot').className = 'status-dot';
+
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws/${session}`);
+
+            ws.onopen = () => {
+                document.getElementById('status-dot').className = 'status-dot connected';
+                if (term) term.clear();
+                // Reset input state for new session
+                lastSentText = '';
+                document.getElementById('mobile-input').value = '';
+            };
+
+            ws.onmessage = (e) => {
+                if (e.data instanceof Blob) {
+                    e.data.text().then(handleMessage);
+                } else {
+                    handleMessage(e.data);
+                }
+            };
+
+            ws.onclose = () => {
+                document.getElementById('status-dot').className = 'status-dot';
+            };
+        }
+
+        function connectToSelected() {
+            const session = document.getElementById('session-select').value;
+            if (session) {
+                localStorage.setItem('mobile-claude-session', session);
+                connect(session);
+            }
+        }
+
+        async function refreshSessions() {
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const select = document.getElementById('session-select');
+                const current = select.value;
+
+                select.innerHTML = '';
+
+                if (data.sessions.length === 0) {
+                    select.innerHTML = '<option value="">No sessions</option>';
+                    return null;
+                }
+
+                data.sessions.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.name;
+                    opt.textContent = s.name + (s.attached ? ' *' : '');
+                    select.appendChild(opt);
+                });
+
+                if (current) select.value = current;
+                return data.sessions[0].name;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function handleKeyboard() {
+            // Adjust layout when iOS keyboard appears/disappears
+            if (window.visualViewport) {
+                const wrapper = document.getElementById('terminal-wrapper');
+                const header = document.querySelector('header');
+                const toolbar = document.querySelector('.key-toolbar');
+
+                function adjustForKeyboard() {
+                    const keyboardHeight = window.innerHeight - window.visualViewport.height;
+                    const keyboardVisible = keyboardHeight > 100;
+
+                    if (keyboardVisible) {
+                        // Keyboard is visible - account for header and toolbar
+                        const fixedHeight = header.offsetHeight + toolbar.offsetHeight + 10;
+                        wrapper.style.height = (window.visualViewport.height - fixedHeight) + 'px';
+                        wrapper.style.flex = 'none';
+                        if (!isTypingMode) setTypingMode(true);
+                    } else {
+                        // Keyboard hidden
+                        wrapper.style.height = '';
+                        wrapper.style.flex = '1';
+                        if (isTypingMode) setTypingMode(false);
+                    }
+                    scrollToBottom();
+                }
+
+                window.visualViewport.addEventListener('resize', adjustForKeyboard);
+                window.visualViewport.addEventListener('scroll', () => window.scrollTo(0, 0));
+            }
+        }
+
+        async function init() {
+            initTerminal(80);  // Start with default cols, will resize on connect
+            handleKeyboard();
+            const first = await refreshSessions();
+
+            // Restore last session or use first available
+            const saved = localStorage.getItem('mobile-claude-session');
+            const select = document.getElementById('session-select');
+            const options = Array.from(select.options).map(o => o.value);
+
+            if (saved && options.includes(saved)) {
+                select.value = saved;
+                connect(saved);
+            } else if (first) {
+                select.value = first;
+                connect(first);
+            }
+            setInterval(refreshSessions, 5000);
+        }
+
+        init();
+    </script>
+</body>
+</html>
