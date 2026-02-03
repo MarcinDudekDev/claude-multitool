@@ -1,0 +1,10 @@
+#!/bin/bash
+# Generate time tracking report from Claude Code transcripts
+# Usage: time-report [YYYY-MM-DD] [days_back] [--html]
+#   time-report               # Today's report
+#   time-report 2026-01-22    # Specific date
+#   time-report 2026-01-22 3  # Date + 3 days back
+#   time-report --html        # Today in HTML format
+
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+python3 "${SCRIPT_DIR}/lib/time_report.py" "$@"

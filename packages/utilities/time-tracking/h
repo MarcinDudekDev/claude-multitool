@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""
+Hours Tracker - Simple time tracking CLI integrated with project picker (p).
+Usage:
+  h                              # Interactive: project → hours → note → date
+  h add <project> <hours> [note] # Quick entry (today by default)
+  h add <project> <hours> --date 2025-12-14  # Entry for specific date
+  h add <project> <hours> --date -1          # Yesterday
+  h today                        # Show today's entries
+  h week                         # Show this week's summary
+  h day 18.12.2025               # Show entries for specific day (DD.MM.YYYY)
+  h day 2025-12-18               # Show entries for specific day (YYYY-MM-DD)
+  h project <name>               # Show all days/hours for a project
+  h edit                         # Interactive edit (fzf)
+  h delete <id>                  # Delete entry
+  h report                       # This month's report
+  h report 2025-12               # Specific month's report
+"""
+
+import json
+import os
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Storage paths (shared projects.json with p tool)
+HOURS_PATH = Path.home() / ".claude" / "hours.json"
+PROJECTS_PATH = Path.home() / ".claude" / "projects.json"
+
+# Colors for terminal output
+class C:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    GRAY = '\033[90m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+def load_hours():
+    """Load hours entries from JSON file."""
+    if HOURS_PATH.exists():
+        with open(HOURS_PATH) as f:
+            data = json.load(f)
+            return data.get('entries', [])
+    return []
+
+def save_hours(entries):
+    """Save hours entries to JSON file."""
+    HOURS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HOURS_PATH, 'w') as f:
+        json.dump({'entries': entries}, f, indent=2)
+
+def load_projects():
+    """Load projects from shared registry with p tool."""
+    if PROJECTS_PATH.exists():
+        with open(PROJECTS_PATH) as f:
+            return json.load(f)
+    return {}
+
+def parse_date(date_str):
+    """Parse date string: YYYY-MM-DD, -N (days ago), or empty (today)."""
+    if not date_str:
+        return datetime.now().strftime('%Y-%m-%d')
+
+    # Relative date: -1 = yesterday, -2 = 2 days ago
+    if date_str.startswith('-') and date_str[1:].isdigit():
+        days_ago = int(date_str[1:])
+        return (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')
+
+    # Absolute date
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+        return date_str
+    except ValueError:
+        print(f"Nieprawidłowy format daty: {date_str} (użyj YYYY-MM-DD lub -N)", file=sys.stderr)
+        sys.exit(1)
+
+def validate_hours(hours_str):
+    """Validate and parse hours (decimal format)."""
+    try:
+        hours = float(hours_str)
+        if hours <= 0 or hours > 24:
+            raise ValueError("Hours must be between 0 and 24")
+        return hours
+    except ValueError:
+        print(f"Nieprawidłowa liczba godzin: {hours_str}", file=sys.stderr)
+        sys.exit(1)
+
+def format_hours(hours):
+    """Format hours for display (e.g., 1.5 → 1.5h)."""
+    if hours == int(hours):
+        return f"{int(hours)}h"
+    return f"{hours}h"
+
+def run_fzf(items, header="Select", query=None):
+    """Run fzf with items and return selection."""
+    if not items:
+        return None
+
+    fzf_input = '\n'.join(items)
+    cmd = ['fzf', '--height=40%', '--layout=reverse', '--border', f'--header={header}']
+
+    if query:
+        cmd.extend(['--query', query])
+
+    try:
+        result = subprocess.run(cmd, input=fzf_input, capture_output=True, text=True)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("fzf not found. Install: brew install fzf", file=sys.stderr)
+        sys.exit(1)
+
+    return None
+
+def input_with_default(prompt, default=""):
+    """Get input with optional default value."""
+    if default:
+        prompt = f"{prompt} [{default}]: "
+    else:
+        prompt = f"{prompt}: "
+
+    try:
+        value = input(prompt).strip()
+        return value if value else default
+    except (EOFError, KeyboardInterrupt):
+        print("\nAnulowano.", file=sys.stderr)
+        sys.exit(0)
+
+# ============ Commands ============
+
+def cmd_interactive():
+    """Interactive mode: project → hours → note → date."""
+    projects = load_projects()
+
+    if not projects:
+        print("Brak projektów. Dodaj przez: p --add <nazwa>", file=sys.stderr)
+        sys.exit(1)
+
+    # 1. Select project
+    project_list = sorted(projects.keys())
+    selected = run_fzf(project_list, header="Wybierz projekt")
+
+    if not selected:
+        print("Anulowano.", file=sys.stderr)
+        return
+
+    project = selected.strip()
+
+    # 2. Enter hours
+    hours_str = input_with_default("Godziny (np. 2.5)")
+    if not hours_str:
+        print("Anulowano.", file=sys.stderr)
+        return
+    hours = validate_hours(hours_str)
+
+    # 3. Enter note (optional)
+    note = input_with_default("Notatka (opcjonalna)", "")
+
+    # 4. Enter date
+    date_str = input_with_default("Data [Enter=dziś, -1=wczoraj, YYYY-MM-DD]", "")
+    date = parse_date(date_str)
+
+    # Save entry
+    entries = load_hours()
+    entry = {
+        'id': str(uuid.uuid4())[:8],
+        'date': date,
+        'project': project,
+        'hours': hours,
+        'note': note,
+        'created': datetime.now().isoformat()
+    }
+    entries.append(entry)
+    save_hours(entries)
+
+    print(f"{C.GREEN}✓{C.END} Zapisano: {C.BOLD}{project}{C.END} {format_hours(hours)} ({date})", end="")
+    if note:
+        print(f" \"{note}\"")
+    else:
+        print()
+
+def cmd_add(args):
+    """Quick add: h add <project> <hours> [note] [--date DATE]."""
+    if len(args) < 2:
+        print("Użycie: h add <projekt> <godziny> [notatka] [--date DATA]", file=sys.stderr)
+        sys.exit(1)
+
+    project = args[0]
+    hours = validate_hours(args[1])
+
+    # Parse remaining args
+    note = ""
+    date_str = ""
+
+    i = 2
+    while i < len(args):
+        if args[i] == '--date' and i + 1 < len(args):
+            date_str = args[i + 1]
+            i += 2
+        else:
+            note = args[i]
+            i += 1
+
+    date = parse_date(date_str)
+
+    # Verify project exists
+    projects = load_projects()
+    if project not in projects:
+        print(f"Projekt '{project}' nie istnieje. Dodaj przez: p --add {project}", file=sys.stderr)
+        sys.exit(1)
+
+    # Save entry
+    entries = load_hours()
+    entry = {
+        'id': str(uuid.uuid4())[:8],
+        'date': date,
+        'project': project,
+        'hours': hours,
+        'note': note,
+        'created': datetime.now().isoformat()
+    }
+    entries.append(entry)
+    save_hours(entries)
+
+    print(f"{C.GREEN}✓{C.END} Zapisano: {C.BOLD}{project}{C.END} {format_hours(hours)} ({date})", end="")
+    if note:
+        print(f" \"{note}\"")
+    else:
+        print()
+
+def cmd_today():
+    """Show today's entries."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    entries = load_hours()
+    today_entries = [e for e in entries if e['date'] == today]
+
+    if not today_entries:
+        print(f"{C.GRAY}Brak wpisów na dziś ({today}){C.END}")
+        return
+
+    print(f"{C.BOLD}=== Dziś ({today}) ==={C.END}\n")
+
+    total = 0
+    for e in today_entries:
+        total += e['hours']
+        note_str = f" - {e['note']}" if e.get('note') else ""
+        print(f"  {C.BLUE}{e['project']:15}{C.END} {format_hours(e['hours']):>6}{note_str}")
+
+    print(f"\n{C.BOLD}Suma: {format_hours(total)}{C.END}")
+
+def cmd_week():
+    """Show last 7 days summary."""
+    today = datetime.now()
+    week_ago = today - timedelta(days=6)  # Last 7 days including today
+
+    entries = load_hours()
+    week_entries = []
+
+    for e in entries:
+        entry_date = datetime.strptime(e['date'], '%Y-%m-%d')
+        if week_ago <= entry_date <= today:
+            week_entries.append(e)
+
+    if not week_entries:
+        print(f"{C.GRAY}Brak wpisów w tym tygodniu{C.END}")
+        return
+
+    # Group by project
+    by_project = {}
+    by_date = {}
+
+    for e in week_entries:
+        proj = e['project']
+        date = e['date']
+
+        by_project[proj] = by_project.get(proj, 0) + e['hours']
+
+        if date not in by_date:
+            by_date[date] = 0
+        by_date[date] += e['hours']
+
+    print(f"{C.BOLD}=== Ostatnie 7 dni ({week_ago.strftime('%Y-%m-%d')} - {today.strftime('%Y-%m-%d')}) ==={C.END}\n")
+
+    print(f"{C.BOLD}Projekty:{C.END}")
+    total = 0
+    for proj, hours in sorted(by_project.items(), key=lambda x: -x[1]):
+        total += hours
+        print(f"  {C.BLUE}{proj:15}{C.END} {format_hours(hours):>6}")
+
+    print(f"\n{C.BOLD}Dni:{C.END}")
+    for date in sorted(by_date.keys()):
+        day_name = datetime.strptime(date, '%Y-%m-%d').strftime('%a')
+        print(f"  {date} ({day_name}): {format_hours(by_date[date])}")
+
+    print(f"\n{C.BOLD}Suma tygodnia: {format_hours(total)}{C.END}")
+
+def cmd_edit():
+    """Interactive edit mode with loop."""
+    while True:
+        entries = load_hours()
+
+        if not entries:
+            print("Brak wpisów do edycji.", file=sys.stderr)
+            return
+
+        # Sort by date descending, show last 30
+        sorted_entries = sorted(entries, key=lambda x: x['date'], reverse=True)[:30]
+
+        # Format for fzf
+        fzf_items = []
+        for e in sorted_entries:
+            note_str = e.get('note', '')[:30] if e.get('note') else ''
+            line = f"{e['id']} | {e['date']} | {e['project']:15} | {format_hours(e['hours']):>6} | {note_str}"
+            fzf_items.append(line)
+
+        selected = run_fzf(fzf_items, header="Wybierz wpis do edycji (Esc=wyjście)")
+
+        if not selected:
+            return  # User pressed Esc - exit
+
+        entry_id = selected.split('|')[0].strip()
+        entry = next((e for e in entries if e['id'] == entry_id), None)
+
+        if not entry:
+            print("Nie znaleziono wpisu.", file=sys.stderr)
+            continue
+
+        # Edit menu
+        print(f"\n{C.BOLD}Edycja:{C.END} {entry['project']} {format_hours(entry['hours'])} ({entry['date']})")
+        if entry.get('note'):
+            print(f"        \"{entry['note']}\"")
+        print()
+        print("1. Zmień godziny")
+        print("2. Zmień notatkę")
+        print("3. Zmień datę")
+        print("4. Zmień projekt")
+        print("5. Usuń wpis")
+        print("0. Powrót do listy")
+
+        choice = input_with_default("Wybór", "0")
+
+        if choice == "1":
+            new_hours = input_with_default("Nowa liczba godzin", str(entry['hours']))
+            entry['hours'] = validate_hours(new_hours)
+            save_hours(entries)
+            print(f"{C.GREEN}✓{C.END} Zaktualizowano godziny")
+        elif choice == "2":
+            entry['note'] = input_with_default("Nowa notatka", entry.get('note', ''))
+            save_hours(entries)
+            print(f"{C.GREEN}✓{C.END} Zaktualizowano notatkę")
+        elif choice == "3":
+            new_date = input_with_default("Nowa data", entry['date'])
+            entry['date'] = parse_date(new_date)
+            save_hours(entries)
+            print(f"{C.GREEN}✓{C.END} Zaktualizowano datę")
+        elif choice == "4":
+            # Change project - show fzf with projects
+            projects = load_projects()
+            if not projects:
+                print("Brak projektów.", file=sys.stderr)
+                continue
+            project_list = sorted(projects.keys())
+            new_project = run_fzf(project_list, header="Wybierz nowy projekt")
+            if new_project:
+                entry['project'] = new_project.strip()
+                save_hours(entries)
+                print(f"{C.GREEN}✓{C.END} Zmieniono projekt na: {entry['project']}")
+        elif choice == "5":
+            entries = [e for e in entries if e['id'] != entry_id]
+            save_hours(entries)
+            print(f"{C.GREEN}✓{C.END} Usunięto wpis")
+        # choice "0" or anything else - just loop back to list
+
+def cmd_delete(entry_id):
+    """Delete entry by ID."""
+    entries = load_hours()
+
+    entry = next((e for e in entries if e['id'] == entry_id), None)
+    if not entry:
+        print(f"Nie znaleziono wpisu o ID: {entry_id}", file=sys.stderr)
+        sys.exit(1)
+
+    entries = [e for e in entries if e['id'] != entry_id]
+    save_hours(entries)
+
+    print(f"{C.GREEN}✓{C.END} Usunięto: {entry['project']} {format_hours(entry['hours'])} ({entry['date']})")
+
+def cmd_report(month=None):
+    """Monthly report."""
+    if month:
+        try:
+            year, mon = month.split('-')
+            target_month = f"{year}-{mon.zfill(2)}"
+        except ValueError:
+            print("Format miesiąca: YYYY-MM (np. 2025-12)", file=sys.stderr)
+            sys.exit(1)
+    else:
+        target_month = datetime.now().strftime('%Y-%m')
+
+    entries = load_hours()
+    month_entries = [e for e in entries if e['date'].startswith(target_month)]
+
+    if not month_entries:
+        print(f"{C.GRAY}Brak wpisów za {target_month}{C.END}")
+        return
+
+    # Parse month name
+    month_date = datetime.strptime(target_month + '-01', '%Y-%m-%d')
+    month_name = month_date.strftime('%B %Y')
+
+    # Group by project
+    by_project = {}
+    days_worked = {}
+
+    for e in month_entries:
+        proj = e['project']
+        date = e['date']
+
+        if proj not in by_project:
+            by_project[proj] = {'hours': 0, 'days': set(), 'entries': []}
+
+        by_project[proj]['hours'] += e['hours']
+        by_project[proj]['days'].add(date)
+        by_project[proj]['entries'].append(e)
+
+        days_worked[date] = days_worked.get(date, 0) + e['hours']
+
+    # Print report
+    print(f"\n{C.BOLD}{'=' * 50}")
+    print(f"  Raport: {month_name}")
+    print(f"{'=' * 50}{C.END}\n")
+
+    print(f"{'Projekt':<20} {'Godziny':>10} {'Dni':>6}")
+    print(f"{'-' * 20} {'-' * 10} {'-' * 6}")
+
+    total_hours = 0
+    total_days = set()
+
+    for proj, data in sorted(by_project.items(), key=lambda x: -x[1]['hours']):
+        total_hours += data['hours']
+        total_days.update(data['days'])
+        print(f"{C.BLUE}{proj:<20}{C.END} {format_hours(data['hours']):>10} {len(data['days']):>6}")
+
+    print(f"{'-' * 20} {'-' * 10} {'-' * 6}")
+    print(f"{C.BOLD}{'SUMA':<20} {format_hours(total_hours):>10} {len(total_days):>6}{C.END}")
+
+    # Daily breakdown
+    print(f"\n{C.BOLD}Dni robocze:{C.END}")
+    for date in sorted(days_worked.keys()):
+        day_name = datetime.strptime(date, '%Y-%m-%d').strftime('%a')
+        print(f"  {date} ({day_name}): {format_hours(days_worked[date])}")
+
+    print()
+
+def cmd_day(date_str):
+    """Show entries for a specific day."""
+    # Parse DD.MM.YYYY or YYYY-MM-DD format
+    target_date = None
+
+    if '.' in date_str:
+        # DD.MM.YYYY format
+        try:
+            parts = date_str.split('.')
+            if len(parts) == 3:
+                day, month, year = parts
+                target_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+                datetime.strptime(target_date, '%Y-%m-%d')  # Validate
+        except (ValueError, IndexError):
+            pass
+    else:
+        # YYYY-MM-DD format
+        try:
+            datetime.strptime(date_str, '%Y-%m-%d')
+            target_date = date_str
+        except ValueError:
+            pass
+
+    if not target_date:
+        print(f"Nieprawidłowy format daty: {date_str}", file=sys.stderr)
+        print("Użyj: DD.MM.YYYY (np. 18.12.2025) lub YYYY-MM-DD (np. 2025-12-18)", file=sys.stderr)
+        sys.exit(1)
+
+    entries = load_hours()
+    day_entries = [e for e in entries if e['date'] == target_date]
+
+    if not day_entries:
+        day_name = datetime.strptime(target_date, '%Y-%m-%d').strftime('%A')
+        print(f"{C.GRAY}Brak wpisów na {target_date} ({day_name}){C.END}")
+        return
+
+    day_name = datetime.strptime(target_date, '%Y-%m-%d').strftime('%A')
+    print(f"\n{C.BOLD}=== {target_date} ({day_name}) ==={C.END}\n")
+
+    total = 0
+    for e in sorted(day_entries, key=lambda x: x.get('created', '')):
+        total += e['hours']
+        note_str = f" - {e['note']}" if e.get('note') else ""
+        print(f"  {C.BLUE}{e['project']:15}{C.END} {format_hours(e['hours']):>6}{note_str}")
+
+    print(f"\n{C.BOLD}Suma: {format_hours(total)}{C.END}\n")
+
+
+def cmd_project(project_name):
+    """Show all days and hours for a specific project."""
+    projects = load_projects()
+
+    # Find exact match or partial match
+    matched_project = None
+    if project_name in projects:
+        matched_project = project_name
+    else:
+        # Try partial match
+        matches = [p for p in projects if project_name.lower() in p.lower()]
+        if len(matches) == 1:
+            matched_project = matches[0]
+        elif len(matches) > 1:
+            print(f"Znaleziono wiele projektów pasujących do '{project_name}':", file=sys.stderr)
+            for m in matches:
+                print(f"  - {m}", file=sys.stderr)
+            sys.exit(1)
+
+    if not matched_project:
+        print(f"Projekt '{project_name}' nie istnieje.", file=sys.stderr)
+        print("Dostępne projekty:", file=sys.stderr)
+        for p in sorted(projects.keys())[:10]:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(1)
+
+    entries = load_hours()
+    project_entries = [e for e in entries if e['project'] == matched_project]
+
+    if not project_entries:
+        print(f"{C.GRAY}Brak wpisów dla projektu '{matched_project}'{C.END}")
+        return
+
+    # Group by date
+    by_date = {}
+    for e in project_entries:
+        date = e['date']
+        if date not in by_date:
+            by_date[date] = {'hours': 0, 'entries': []}
+        by_date[date]['hours'] += e['hours']
+        by_date[date]['entries'].append(e)
+
+    # Group by month for summary
+    by_month = {}
+    for date, data in by_date.items():
+        month = date[:7]  # YYYY-MM
+        if month not in by_month:
+            by_month[month] = 0
+        by_month[month] += data['hours']
+
+    print(f"\n{C.BOLD}{'=' * 50}")
+    print(f"  Projekt: {matched_project}")
+    print(f"{'=' * 50}{C.END}\n")
+
+    # Summary by month
+    print(f"{C.BOLD}Podsumowanie miesięczne:{C.END}")
+    total_hours = 0
+    for month in sorted(by_month.keys(), reverse=True):
+        month_date = datetime.strptime(month + '-01', '%Y-%m-%d')
+        month_name = month_date.strftime('%B %Y')
+        total_hours += by_month[month]
+        print(f"  {month_name:20} {format_hours(by_month[month]):>8}")
+
+    print(f"  {'-' * 30}")
+    print(f"  {C.BOLD}{'SUMA':20} {format_hours(total_hours):>8}{C.END}")
+
+    # Detailed list by date
+    print(f"\n{C.BOLD}Szczegóły (ostatnie 30 dni):{C.END}")
+    sorted_dates = sorted(by_date.keys(), reverse=True)[:30]
+
+    for date in sorted_dates:
+        data = by_date[date]
+        day_name = datetime.strptime(date, '%Y-%m-%d').strftime('%a')
+
+        if len(data['entries']) == 1:
+            e = data['entries'][0]
+            note_str = f" - {e['note']}" if e.get('note') else ""
+            print(f"  {date} ({day_name}): {format_hours(data['hours']):>6}{note_str}")
+        else:
+            print(f"  {date} ({day_name}): {format_hours(data['hours']):>6}")
+            for e in data['entries']:
+                note_str = f" {e['note']}" if e.get('note') else ""
+                print(f"    {C.GRAY}└ {format_hours(e['hours'])}{note_str}{C.END}")
+
+    if len(by_date) > 30:
+        print(f"\n  {C.GRAY}... i {len(by_date) - 30} więcej dni{C.END}")
+
+    print()
+
+
+def cmd_help():
+    """Print help message."""
+    print(__doc__)
+
+# ============ Main ============
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        cmd_interactive()
+        return
+
+    cmd = args[0]
+
+    if cmd in ['-h', '--help', 'help']:
+        cmd_help()
+    elif cmd == 'add':
+        cmd_add(args[1:])
+    elif cmd == 'today':
+        cmd_today()
+    elif cmd == 'week':
+        cmd_week()
+    elif cmd == 'edit':
+        cmd_edit()
+    elif cmd == 'delete' and len(args) > 1:
+        cmd_delete(args[1])
+    elif cmd == 'report':
+        cmd_report(args[1] if len(args) > 1 else None)
+    elif cmd == 'day' and len(args) > 1:
+        cmd_day(args[1])
+    elif cmd == 'project' and len(args) > 1:
+        cmd_project(args[1])
+    else:
+        print(f"Nieznana komenda: {cmd}", file=sys.stderr)
+        print("Użyj: h --help", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
