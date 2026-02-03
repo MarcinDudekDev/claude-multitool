@@ -1,0 +1,20 @@
+#!/bin/bash
+# SSH tail wrapper - tail files on remote hosts
+# Usage: ssh-tail <host> <file> [tail-args...]
+# Examples:
+#   ssh-tail anna152 /var/log/nginx/error.log        # last 100 lines
+#   ssh-tail anna152 /var/log/nginx/error.log -50    # last 50 lines
+#   ssh-tail anna152 /var/log/nginx/error.log -f     # follow mode
+#   ssh-tail anna152 /var/log/nginx/error.log -f -n 20  # follow, start with 20 lines
+
+[[ -z "$2" ]] && { echo "Usage: ssh-tail <host> <file> [tail-args...]"; exit 1; }
+
+host="$1"
+file="$2"
+shift 2
+# Default to -100 if no args, otherwise pass all args
+if [[ -z "$*" ]]; then
+    ssh "$host" "tail -100 '$file'"
+else
+    ssh "$host" "tail $* '$file'"
+fi

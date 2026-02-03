@@ -1,0 +1,23 @@
+#!/bin/bash
+# SSH sqlite3 wrapper - run sqlite3 queries on remote database
+# Usage: ssh-sqlite <host> <db_path> <sql_or_file>
+# Examples:
+#   ssh-sqlite anna152 /var/www/app/data.db "SELECT * FROM users"
+#   ssh-sqlite anna152 /var/www/app/data.db /path/to/script.sql
+
+[[ -z "$1" || -z "$2" || -z "$3" ]] && { echo "Usage: ssh-sqlite <host> <db_path> <sql_or_file>"; exit 1; }
+
+host="$1"
+db_path="$2"
+sql_or_file="$3"
+
+# If it looks like a file path, use it as input
+if [[ "$sql_or_file" == /* && -f "$sql_or_file" ]]; then
+    cat "$sql_or_file" | ssh "$host" "sqlite3 '$db_path'"
+elif [[ "$sql_or_file" == *.sql ]]; then
+    # Remote file
+    ssh "$host" "sqlite3 '$db_path' < '$sql_or_file'"
+else
+    # Direct SQL
+    ssh "$host" "sqlite3 '$db_path' '$sql_or_file'"
+fi

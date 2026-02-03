@@ -1,0 +1,14 @@
+#!/bin/bash
+# SSH systemctl status wrapper - check service status on remote hosts
+# Usage: ssh-status <host> <service> [systemctl-args...]
+# Examples:
+#   ssh-status anna152 nginx                  # check nginx status
+#   ssh-status anna152 nginx --no-pager       # without pager
+#   ssh-status anna152 nginx -l               # full output
+
+[[ -z "$2" ]] && { echo "Usage: ssh-status <host> <service> [systemctl-args...]"; exit 1; }
+
+host="$1"
+service="$2"
+shift 2
+ssh "$host" "systemctl status $* '$service'"

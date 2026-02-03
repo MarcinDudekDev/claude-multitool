@@ -1,0 +1,17 @@
+#!/bin/bash
+# SSH ps wrapper - list processes on remote hosts
+# Usage: ssh-ps <host> [pattern] [ps-args...]
+# Examples:
+#   ssh-ps anna152              # ps aux (all processes)
+#   ssh-ps anna152 node         # grep for 'node'
+#   ssh-ps anna152 php-fpm      # grep for 'php-fpm'
+
+[[ -z "$1" ]] && { echo "Usage: ssh-ps <host> [grep-pattern]"; exit 1; }
+
+host="$1"
+shift
+if [[ -n "$1" ]]; then
+    ssh "$host" "ps aux | grep '$1' | grep -v grep"
+else
+    ssh "$host" "ps aux"
+fi

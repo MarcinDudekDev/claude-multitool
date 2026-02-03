@@ -1,0 +1,12 @@
+#!/bin/bash
+# SSH wrapper for Windows PC (RTX4070) via Tailscale
+# Usage: ssh-pc <command...>
+# Examples:
+#   ssh-pc hostname
+#   ssh-pc ollama list
+#   ssh-pc ollama pull llama3.1:8b
+#   ssh-pc curl http://localhost:11434/api/tags
+
+[[ -z "$1" ]] && { echo "Usage: ssh-pc <command...>"; exit 1; }
+
+ssh -o ConnectTimeout=5 pc "$*"

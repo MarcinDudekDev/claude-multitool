@@ -1,0 +1,13 @@
+#!/bin/bash
+# SSH curl wrapper - run curl on remote server
+# Usage: ssh-curl <host> <url> [args...]
+# Examples:
+#   ssh-curl anna152 http://127.0.0.1:5017/
+#   ssh-curl anna152 http://localhost/ -I
+
+[[ -z "$1" || -z "$2" ]] && { echo "Usage: ssh-curl <host> <url> [args...]"; exit 1; }
+
+host="$1"
+url="$2"
+shift 2
+ssh "$host" "curl -s '$url' $*"

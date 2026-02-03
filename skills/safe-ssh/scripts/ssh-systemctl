@@ -1,0 +1,24 @@
+#!/bin/bash
+# SSH systemctl wrapper - manage systemd services
+# Usage: ssh-systemctl <host> <action> <service> [args...]
+# Examples:
+#   ssh-systemctl anna152 restart the-throne
+#   ssh-systemctl anna152 status nginx --no-pager
+
+[[ -z "$1" || -z "$2" || -z "$3" ]] && { echo "Usage: ssh-systemctl <host> <action> <service> [args...]"; exit 1; }
+
+host="$1"
+action="$2"
+service="$3"
+shift 3
+
+# Only allow safe actions
+case "$action" in
+    restart|reload|status|start|stop)
+        ssh "$host" "sudo systemctl $action $service $*"
+        ;;
+    *)
+        echo "Allowed actions: restart, reload, status, start, stop"
+        exit 1
+        ;;
+esac

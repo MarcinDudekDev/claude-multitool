@@ -1,0 +1,15 @@
+#!/bin/bash
+# SSH df wrapper - check disk space on remote hosts
+# Usage: ssh-df <host> [df-args...]
+# Examples:
+#   ssh-df anna152           # df -h (default human-readable)
+#   ssh-df anna152 -i        # show inodes
+#   ssh-df anna152 -T        # show filesystem type
+#   ssh-df anna152 /var      # specific mount point
+
+[[ -z "$1" ]] && { echo "Usage: ssh-df <host> [df-args...]"; exit 1; }
+
+host="$1"
+shift
+# Default to -h if no args provided
+ssh "$host" "df ${*:--h}"

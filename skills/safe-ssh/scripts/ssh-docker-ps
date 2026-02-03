@@ -1,0 +1,14 @@
+#!/bin/bash
+# SSH docker ps wrapper - list containers on remote hosts
+# Usage: ssh-docker-ps <host> [docker-ps-args...]
+# Examples:
+#   ssh-docker-ps anna152             # docker ps -a (all containers)
+#   ssh-docker-ps anna152 -q          # quiet (IDs only)
+#   ssh-docker-ps anna152 --format "{{.Names}}"   # custom format
+
+[[ -z "$1" ]] && { echo "Usage: ssh-docker-ps <host> [docker-ps-args...]"; exit 1; }
+
+host="$1"
+shift
+# Default to -a if no args provided
+ssh "$host" "docker ps ${*:--a}"

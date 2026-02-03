@@ -1,0 +1,37 @@
+#!/bin/bash
+# SSH wp-cli wrapper - run WordPress CLI on remote hosts
+# Tries: sudo www-data -> --allow-root -> plain wp
+# Filters PHP notices/warnings from output
+#
+# Usage: ssh-wp <host> <site-dir> <wp-command...>
+# Examples:
+#   ssh-wp anna152 /var/www/site plugin list
+#   ssh-wp oek /path/to/wp option get siteurl
+
+[[ -z "$3" ]] && { echo "Usage: ssh-wp <host> <site-dir> <wp-command...>"; exit 1; }
+
+host="$1"
+site_dir="$2"
+shift 2
+
+# Build args with double-quote escaping
+wp_args=""
+for arg in "$@"; do
+    # Escape backslashes, double quotes, dollar signs, backticks
+    escaped="${arg//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//\$/\\\$}"
+    escaped="${escaped//\`/\\\`}"
+    wp_args="$wp_args \"$escaped\""
+done
+
+# Run on remote, filter PHP notices
+ssh "$host" "cd \"$site_dir\" && {
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo -u www-data wp $wp_args
+elif [ \"\$(id -u)\" -eq 0 ]; then
+    wp --allow-root $wp_args
+else
+    wp $wp_args
+fi
+}" 2>&1 | grep -Ev "^Notice:|^Warning:|^Deprecated:|was called .incorrectly"

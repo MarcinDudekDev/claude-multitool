@@ -1,0 +1,24 @@
+#!/bin/bash
+# SSH ls wrapper - list directories on remote hosts
+# Usage: ssh-ls <host> [ls-args...] [path]
+# Examples:
+#   ssh-ls anna152                     # ls current dir
+#   ssh-ls anna152 /var/www            # ls /var/www
+#   ssh-ls anna152 -la                 # ls -la current dir
+#   ssh-ls anna152 -la /var/www        # ls -la /var/www
+#   ssh-ls anna152 -lah --color=never  # multiple flags
+#   ssh-ls anna152 ~/tools             # remote ~ (auto-fixed)
+
+[[ -z "$1" ]] && { echo "Usage: ssh-ls <host> [ls-args...]"; exit 1; }
+
+host="$1"
+shift
+
+# Fix local ~ expansion: convert /Users/username/... back to ~/...
+args=()
+for arg in "$@"; do
+    [[ "$arg" == "$HOME"* ]] && arg="~${arg#$HOME}"
+    args+=("$arg")
+done
+
+ssh "$host" "ls ${args[*]:-.}"

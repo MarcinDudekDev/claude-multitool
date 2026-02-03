@@ -1,0 +1,19 @@
+#!/bin/bash
+# SSH cat wrapper - read file contents on remote hosts
+# Usage: ssh-cat <host> <file> [cat-args...]
+# Examples:
+#   ssh-cat anna152 /etc/nginx/nginx.conf      # read file
+#   ssh-cat anna152 /etc/nginx/nginx.conf -n   # with line numbers
+#   ssh-cat anna152 /etc/nginx/nginx.conf -A   # show all (including tabs/newlines)
+#   ssh-cat anna152 ~/config.txt               # remote ~ (auto-fixed)
+
+[[ -z "$2" ]] && { echo "Usage: ssh-cat <host> <file> [cat-args...]"; exit 1; }
+
+host="$1"
+file="$2"
+shift 2
+
+# Fix local ~ expansion: convert /Users/username/... back to ~/...
+[[ "$file" == "$HOME"* ]] && file="~${file#$HOME}"
+
+ssh "$host" "cat $* '$file'"

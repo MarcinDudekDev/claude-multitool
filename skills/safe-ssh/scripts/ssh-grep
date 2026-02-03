@@ -1,0 +1,19 @@
+#!/bin/bash
+# SSH grep wrapper - search files on remote hosts
+# Usage: ssh-grep <host> <pattern> [path] [grep-args...]
+# Examples:
+#   ssh-grep anna152 "error"                    # search current dir
+#   ssh-grep anna152 "error" /var/log           # search /var/log
+#   ssh-grep anna152 "error" /var/log -i        # case insensitive
+#   ssh-grep anna152 "error" /var/log -l        # files only
+#   ssh-grep anna152 "error" /var/log -n -i     # with line numbers, case insensitive
+
+[[ -z "$2" ]] && { echo "Usage: ssh-grep <host> <pattern> [path] [grep-args...]"; exit 1; }
+
+host="$1"
+pattern="$2"
+path="${3:-.}"
+shift 3 2>/dev/null || shift 2
+
+# Pass remaining args as grep flags
+ssh "$host" "grep -r $* '$pattern' '$path' 2>/dev/null || true"
