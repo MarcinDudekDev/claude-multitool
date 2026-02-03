@@ -1,0 +1,143 @@
+#!/bin/bash
+# memorize - unified memory storage
+# Usage: memorize <content>
+#        memorize -t <cat> -i <imp> -g <tags> <content>
+#
+# Auto-categorizes by default. Use flags for explicit control.
+# Categories: preference, fact, context, decision, task, solution
+# Importance: 1-10 (higher = more important)
+
+set -e
+
+# Find memory CLI - configurable via MEMORY_CLI env var
+MEMORY_CLI="${MEMORY_CLI:-}"
+if [ -z "$MEMORY_CLI" ]; then
+    for loc in "$HOME/.local/bin/memory" "$HOME/Tools/memory" "$(dirname "$0")/../helix-memory/memory"; do
+        if [ -f "$loc" ]; then
+            MEMORY_CLI="$loc"
+            break
+        fi
+    done
+fi
+if [ -z "$MEMORY_CLI" ] || [ ! -f "$MEMORY_CLI" ]; then
+    echo "Error: memory CLI not found. Set MEMORY_CLI env var." >&2
+    exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: memorize <content> [-t category] [-i importance] [-g tags]"
+    echo "       memorize -t preference -i 10 \"Always test before marking complete\""
+    exit 1
+fi
+
+# Auto-detect project from CLAUDE_PROJECT env var or current directory
+detect_project() {
+    # First check CLAUDE_PROJECT env var
+    if [[ -n "$CLAUDE_PROJECT" ]]; then
+        echo "$CLAUDE_PROJECT"
+        return
+    fi
+
+    # Fall back to detecting from pwd
+    local cwd="$PWD"
+    local home="$HOME"
+
+    # Known project roots (directories that contain projects)
+    # Check if we're in a subdirectory of home and extract the top-level project dir
+    if [[ "$cwd" == "$home/"* ]]; then
+        # Remove home prefix, get first directory component
+        local rel="${cwd#$home/}"
+        local project="${rel%%/*}"
+
+        # Skip generic directories that aren't projects
+        case "$project" in
+            Tools|Downloads|Documents|Desktop|Library|Applications|Pictures|Music|Movies|Public)
+                return
+                ;;
+            *)
+                # Valid project directory
+                echo "$project"
+                ;;
+        esac
+    fi
+}
+
+# Parse args - if no flags, auto-categorize; otherwise explicit
+CATEGORY=""
+IMPORTANCE=""
+TAGS=""
+CONTENT=""
+AUTO_PROJECT=$(detect_project)
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--type|--category)
+            CATEGORY="$2"
+            shift 2
+            ;;
+        -i|--importance)
+            IMPORTANCE="$2"
+            shift 2
+            ;;
+        -g|--tags)
+            TAGS="$2"
+            shift 2
+            ;;
+        -c|--content)
+            # Silently accept -c flag (for compatibility)
+            CONTENT="$2"
+            shift 2
+            ;;
+        *)
+            # Everything else is content
+            if [[ -z "$CONTENT" ]]; then
+                CONTENT="$1"
+            else
+                CONTENT="$CONTENT $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$CONTENT" ]]; then
+    echo "Error: No content provided"
+    exit 1
+fi
+
+# Merge auto-detected project with any user-provided tags
+merge_tags() {
+    local user_tags="$1"
+    local project="$2"
+
+    if [[ -z "$project" ]]; then
+        echo "$user_tags"
+    elif [[ -z "$user_tags" ]]; then
+        echo "$project"
+    else
+        # Check if project already in tags (avoid duplicates)
+        if [[ "$user_tags" == *"$project"* ]]; then
+            echo "$user_tags"
+        else
+            echo "$user_tags,$project"
+        fi
+    fi
+}
+
+FINAL_TAGS=$(merge_tags "$TAGS" "$AUTO_PROJECT")
+
+# If no flags given, auto-categorize (but still add project tag if detected)
+if [[ -z "$CATEGORY" && -z "$IMPORTANCE" && -z "$TAGS" ]]; then
+    if [[ -n "$AUTO_PROJECT" ]]; then
+        $MEMORY_CLI remember "$CONTENT" -g "$AUTO_PROJECT"
+    else
+        $MEMORY_CLI remember "$CONTENT"
+    fi
+else
+    # Build explicit store command (memory store adds -c internally)
+    CMD=($MEMORY_CLI store "$CONTENT")
+    [[ -n "$CATEGORY" ]] && CMD+=(-t "$CATEGORY")
+    [[ -n "$IMPORTANCE" ]] && CMD+=(-i "$IMPORTANCE")
+    [[ -n "$FINAL_TAGS" ]] && CMD+=(-g "$FINAL_TAGS")
+    "${CMD[@]}"
+fi
