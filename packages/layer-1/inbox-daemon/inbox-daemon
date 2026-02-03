@@ -1,0 +1,292 @@
+#!/bin/bash
+# Inbox daemon - auto-delivers queued messages when target panes are idle
+
+show_help() {
+    cat << 'EOF'
+inbox-daemon - Auto-deliver queued messages to idle Claude sessions
+
+USAGE:
+  inbox-daemon start       Start the daemon
+  inbox-daemon stop        Stop the daemon
+  inbox-daemon status      Show daemon status + queued messages
+  inbox-daemon queue       Show only queued messages (alias: q)
+  inbox-daemon --help      Show this help
+
+HOW IT WORKS:
+  1. Messages sent via 'msg' are queued in ~/.claude/inbox/<project>.jsonl
+  2. Daemon polls every 3s, checks 'op --status --quick' for each target
+  3. Only delivers when target shows '✓ idle'
+  4. Working (⚡) or blocked (⏸) states keep messages queued
+  5. 5s minimum delay between messages to same project, then waits for idle
+
+MESSAGE FORMAT:
+  - Task messages: 📨 [source]: message
+  - Slash commands (/clear): sent raw without envelope
+
+LOGS:
+  ~/.claude/inbox-daemon.log    Delivery log
+  ~/.claude/inbox-daemon.pid    Daemon PID file
+EOF
+}
+
+INBOX_DIR="$HOME/.claude/inbox"
+PID_FILE="$HOME/.claude/inbox-daemon.pid"
+LOG_FILE="$HOME/.claude/inbox-daemon.log"
+POLL_INTERVAL=3
+MESSAGE_DELAY=5  # Minimum seconds between messages to same project
+
+# Source shared pane detection utilities
+# PANE_STATUS can be set to override default location
+PANE_STATUS="${PANE_STATUS:-}"
+if [ -z "$PANE_STATUS" ]; then
+    # Try common locations
+    for loc in "$HOME/.local/bin/pane-status" "$HOME/Tools/pane-status" "$(dirname "$0")/../layer-0/pane-status/pane-status"; do
+        if [ -f "$loc" ]; then
+            PANE_STATUS="$loc"
+            break
+        fi
+    done
+fi
+if [ -z "$PANE_STATUS" ] || [ ! -f "$PANE_STATUS" ]; then
+    echo "Error: pane-status not found. Set PANE_STATUS env var." >&2
+    exit 1
+fi
+source "$PANE_STATUS"
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# Wait for Claude to become idle (not working)
+# Uses pane-status functions for DRY
+wait_for_idle() {
+    local target="$1"
+    local timeout="${2:-30}"
+    local count=0
+
+    # Grace period: let Claude start processing before checking status
+    sleep 2
+
+    while [ $count -lt $timeout ]; do
+        if is_pane_safe_to_send "$target"; then
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    return 1
+}
+
+deliver_message() {
+    local target="$1"
+    local message="$2"
+    local type="$3"
+    local from="$4"
+
+    # Format based on type
+    if [ "$type" = "prompt" ]; then
+        formatted="$message"
+    else
+        formatted="$type [$from]: $message"
+    fi
+
+    # Send via tmux
+    tmux send-keys -t "$target" "$formatted"
+    sleep 0.1
+    tmux send-keys -t "$target" Enter
+    log "Delivered to $target: ${formatted:0:50}..."
+}
+
+process_inbox() {
+    local inbox_file="$1"
+    local target=$(basename "$inbox_file" .jsonl)
+    local lock_dir="${inbox_file}.lock"
+
+    # Skip if no tmux session
+    tmux has-session -t "$target" 2>/dev/null || return
+
+    # Try to acquire exclusive lock using mkdir (atomic on all Unix)
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        # Check if lock is stale (older than 5 minutes)
+        if [ -d "$lock_dir" ]; then
+            local lock_age=$(( $(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || echo 0) ))
+            if [ $lock_age -gt 300 ]; then
+                rm -rf "$lock_dir"
+                mkdir "$lock_dir" 2>/dev/null || return
+            else
+                return  # Lock held by another process
+            fi
+        fi
+        return
+    fi
+
+    # Cleanup function
+    cleanup_lock() { rm -rf "$lock_dir" 2>/dev/null; }
+    trap cleanup_lock EXIT
+
+    # Verify file still exists after acquiring lock
+    [ -f "$inbox_file" ] || { cleanup_lock; return; }
+
+    # Read first message to check start_mode
+    local first_msg=$(head -1 "$inbox_file" 2>/dev/null)
+    [ -z "$first_msg" ] && { cleanup_lock; return; }
+
+    local start_mode=$(echo "$first_msg" | python3 -c "import sys,json; print(json.load(sys.stdin).get('start_mode','continue'))" 2>/dev/null)
+
+    # Ensure Claude is running (auto-start if needed)
+    if ! ensure_claude_started "$target" "$start_mode"; then
+        log "Failed to start Claude in $target"
+        cleanup_lock
+        return
+    fi
+    [ "$CLAUDE_WAS_STARTED" = "1" ] && log "Started Claude ($start_mode) in $target"
+
+    # Skip if not safe to send (working or has input)
+    if ! is_pane_safe_to_send "$target"; then
+        cleanup_lock
+        return
+    fi
+
+    # Read ALL messages into array (memory) FIRST
+    local messages=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && messages+=("$line")
+    done < "$inbox_file"
+
+    local msg_count=${#messages[@]}
+    [ $msg_count -eq 0 ] && { cleanup_lock; return; }
+
+    # Archive and delete file BEFORE delivering (prevents race condition)
+    cat "$inbox_file" >> "${inbox_file%.jsonl}.read.jsonl" 2>/dev/null
+    rm -f "$inbox_file"
+
+    # Release lock now that file is gone
+    cleanup_lock
+
+    # Deliver from memory
+    local delivered=0
+    for line in "${messages[@]}"; do
+        local message=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null)
+        local type=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('type','📨'))" 2>/dev/null)
+        local from=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('from','unknown'))" 2>/dev/null)
+
+        [ -z "$message" ] && continue
+
+        deliver_message "$target" "$message" "$type" "$from"
+        delivered=$((delivered + 1))
+
+        # Minimum delay between messages to prevent overwhelming the session
+        if [ $delivered -lt $msg_count ]; then
+            log "Waiting ${MESSAGE_DELAY}s before next message..."
+            sleep "$MESSAGE_DELAY"
+            # Then wait for Claude to be idle (max 30s)
+            wait_for_idle "$target" 30 || log "Timeout waiting for idle after message $delivered"
+        fi
+    done
+
+    log "Delivered $delivered message(s) to $target"
+}
+
+daemon_loop() {
+    log "Daemon started (PID $$)"
+    while true; do
+        # Process all inbox files
+        for inbox in "$INBOX_DIR"/*.jsonl; do
+            [ -f "$inbox" ] || continue
+            [[ "$inbox" == *.read.jsonl ]] && continue
+            process_inbox "$inbox"
+        done
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+start_daemon() {
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Daemon already running (PID $pid)"
+            exit 1
+        fi
+        rm "$PID_FILE"
+    fi
+
+    # Kill any stale daemon processes (orphans from crashes)
+    pkill -f "inbox-daemon _run" 2>/dev/null
+    sleep 0.5
+
+    # Clean up any stale lock directories
+    rm -rf "$INBOX_DIR"/*.lock 2>/dev/null
+
+    mkdir -p "$INBOX_DIR"
+    nohup "$0" _run >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Daemon started (PID $!)"
+}
+
+stop_daemon() {
+    if [ ! -f "$PID_FILE" ]; then
+        echo "Daemon not running"
+        exit 1
+    fi
+
+    local pid=$(cat "$PID_FILE")
+    if kill "$pid" 2>/dev/null; then
+        rm "$PID_FILE"
+        echo "Daemon stopped (PID $pid)"
+    else
+        rm "$PID_FILE"
+        echo "Daemon was not running (stale PID)"
+    fi
+}
+
+show_queue() {
+    local found=0
+    for inbox in "$INBOX_DIR"/*.jsonl; do
+        [ -f "$inbox" ] || continue
+        [[ "$inbox" == *.read.jsonl ]] && continue
+        local count=$(wc -l < "$inbox" | tr -d ' ')
+        local target=$(basename "$inbox" .jsonl)
+        echo "  $target: $count message(s)"
+        found=1
+    done
+    [ $found -eq 0 ] && echo "  (none)"
+}
+
+show_status() {
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Running (PID $pid)"
+            echo "Queued:"
+            show_queue
+            return 0
+        fi
+    fi
+    echo "Not running"
+    return 1
+}
+
+case "${1:-status}" in
+    start)
+        start_daemon
+        ;;
+    stop)
+        stop_daemon
+        ;;
+    status)
+        show_status
+        ;;
+    queue|q)
+        show_queue
+        ;;
+    --help|-h|help)
+        show_help
+        ;;
+    _run)
+        daemon_loop
+        ;;
+    *)
+        echo "Usage: inbox-daemon start|stop|status|queue|--help"
+        exit 1
+        ;;
+esac

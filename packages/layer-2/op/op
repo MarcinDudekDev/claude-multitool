@@ -1,0 +1,1596 @@
+#!/usr/bin/env python3
+"""
+Open projects and send tasks to Claude.
+
+COMMON OPERATIONS:
+  op <project>                    # Open project window
+  op <project> "task to do"       # Open + send prompt (auto-detects text vs file)
+  op <project> ~/prompt.md        # Open + send prompt from file
+
+  op --status                     # Show all open projects
+  op --restart <project>          # Restart Claude in project
+
+OPEN PROJECTS:
+  op <name>...                    # Open by name (fuzzy match)
+  op --yesterday                  # Projects from yesterday
+  op --recent N                   # N most recent projects
+  op --default                    # Saved default set
+  op                              # (no args) Same as --default
+
+SEND PROMPTS (project must be open):
+  op --prompt <name> "text"       # Send prompt text
+  op --prompt-file <name> <file>  # Send prompt from file
+
+MANAGE SESSIONS:
+  op --status [--quick]           # Show project status
+  op --restart <name>...          # Restart Claude in projects
+  op --restart-all                # Restart all idle sessions
+
+ADVANCED:
+  op --attach <name>              # Reopen iTerm for existing tmux session
+  op -a <name>                    # Short form of --attach
+  op -c <name> "task"             # Continue existing context (for follow-ups)
+  op --no-tmux <name>...          # Open without tmux (plain iTerm)
+  op --mobile <name>...           # Also start mobile server
+  op --save-default <name>...     # Save as default set
+  op --since "N days ago"         # Projects from date range
+  op --date 2026-01-10            # Projects from specific date
+  op --dry-run                    # Preview without opening
+
+SESSION CONTEXT:
+  By default, sending a NEW task to a running session uses /clear first
+  for fresh context (prevents compaction waste and context pollution).
+  Use -c/--continue to explicitly continue in existing context for follow-ups.
+
+NOTE: Sessions use tmux by default for mobile access + single instance per project.
+
+Examples:
+  op tools                        # Just open
+  op tools "Fix the bug in X"     # Open + send task
+  op tools ~/tasks/fix-bug.md     # Open + send from file
+  op --restart tools              # Restart Claude
+  op --status                     # Check all projects
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Configuration paths - can be overridden via environment variables
+PROJECTS_REGISTRY = Path(os.environ.get('PROJECTS_REGISTRY', Path.home() / ".claude" / "projects.json"))
+CONFIG_DIR = Path(os.environ.get('OP_CONFIG_DIR', Path.home() / ".config" / "open-projects"))
+DEFAULT_FILE = CONFIG_DIR / "default.json"
+
+# Tool paths - auto-detect from common locations
+def find_tool(name, env_var, candidates):
+    """Find tool in environment var or common locations."""
+    from_env = os.environ.get(env_var, '')
+    if from_env and Path(from_env).exists():
+        return Path(from_env)
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return path
+    return Path(candidates[0]).expanduser()  # Return first as fallback
+
+P_TOOL = find_tool('p', 'P_TOOL', [
+    '~/.local/bin/p',
+    '~/Tools/p',
+    str(Path(__file__).parent.parent / 'layer-0' / 'p' / 'p'),
+])
+MSG_TOOL = find_tool('msg', 'MSG_TOOL', [
+    '~/.local/bin/msg',
+    '~/Tools/msg',
+    str(Path(__file__).parent.parent / 'layer-1' / 'msg' / 'msg'),
+])
+TILE_APP = Path(os.environ.get('TILE_APP', Path.home() / "Applications" / "TileITerm.app"))
+MOBILE_CLAUDE_DIR = Path(os.environ.get('MOBILE_CLAUDE_DIR', ''))
+
+
+def load_projects_registry():
+    """Load projects.json directly for date filtering."""
+    if PROJECTS_REGISTRY.exists():
+        with open(PROJECTS_REGISTRY) as f:
+            return json.load(f)
+    return {}
+
+
+def save_projects_registry(registry):
+    """Save projects.json."""
+    with open(PROJECTS_REGISTRY, "w") as f:
+        json.dump(registry, f, indent=2)
+
+
+def update_last_accessed(project_name):
+    """Update last_accessed timestamp for a project."""
+    registry = load_projects_registry()
+    if project_name in registry:
+        registry[project_name]['last_accessed'] = datetime.now().strftime("%Y-%m-%d")
+        save_projects_registry(registry)
+
+
+def search_project(name):
+    """Call p --search to fuzzy match project. Returns list of matches."""
+    result = subprocess.run(
+        [str(P_TOOL), "--search", name],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def get_existing_profiles():
+    """Get list of profile names from all open iTerm2 windows."""
+    script = '''
+tell application "iTerm2"
+    set profileList to {}
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                set end of profileList to profile name of s
+            end repeat
+        end repeat
+    end repeat
+    return profileList
+end tell
+'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # AppleScript returns comma-separated list
+            profiles = result.stdout.strip()
+            # Handle both "profile1, profile2" and just "profile1"
+            return [p.strip() for p in profiles.split(", ")]
+    except Exception:
+        pass
+    return []
+
+
+def open_iterm_window(profile_name):
+    """Open iTerm2 window with given profile, positioned at bottom-right."""
+    script = f'''
+tell application "iTerm2"
+    create window with profile "{profile_name}"
+    -- Position new window at bottom-right (large coords get clamped to screen edge)
+    tell current window
+        set bounds to {{9999, 9999, 10500, 10500}}
+    end tell
+end tell
+'''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def open_iterm_with_tmux(session_name, project_path, profile_name=None):
+    """Open iTerm2 window with tmux session for mobile access.
+
+    Creates a detached tmux session, starts Claude in it, then opens
+    iTerm attached to that session. Mobile can access via mobile-claude.
+    """
+    # Sanitize session name for tmux (alphanumeric, dash, underscore only)
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '-', session_name).lower()
+
+    # Use profile_name if provided, otherwise use session_name as profile
+    iterm_profile = profile_name or session_name
+
+    # Check if session already exists
+    check = subprocess.run(["tmux", "has-session", "-t", safe_name], capture_output=True)
+    if check.returncode == 0:
+        # Session exists - just attach iTerm to it
+        print(f"  Attaching to existing tmux session: {safe_name}", file=sys.stderr)
+    else:
+        # Create new tmux session with Claude
+        subprocess.run([
+            "tmux", "new-session", "-d", "-s", safe_name, "-c", str(project_path)
+        ], capture_output=True)
+        # Start Claude in the session
+        subprocess.run([
+            "tmux", "send-keys", "-t", safe_name, "claude", "Enter"
+        ], capture_output=True)
+
+    # Open iTerm window with PROJECT PROFILE, then attach to tmux
+    # Position new window at bottom-right so it doesn't disrupt existing window order when tiling
+    script = f'''
+tell application "iTerm2"
+    create window with profile "{iterm_profile}"
+    tell current session of current window
+        write text "tmux attach -t {safe_name}"
+    end tell
+    -- Position new window at bottom-right (large coords get clamped to screen edge)
+    tell current window
+        set bounds to {{9999, 9999, 10500, 10500}}
+    end tell
+end tell
+'''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def start_mobile_server():
+    """Start mobile-claude server if not already running."""
+    # Check if already running
+    check = subprocess.run(
+        ["pgrep", "-f", "mobile-claude.*server.py"],
+        capture_output=True
+    )
+    if check.returncode == 0:
+        print("Mobile server already running.", file=sys.stderr)
+        return True
+
+    if not MOBILE_CLAUDE_DIR or not MOBILE_CLAUDE_DIR.exists():
+        print("Mobile Claude not configured. Set MOBILE_CLAUDE_DIR env var.", file=sys.stderr)
+        return False
+
+    # Start server in background
+    server_script = MOBILE_CLAUDE_DIR / "server.py"
+    venv_python = MOBILE_CLAUDE_DIR / ".venv" / "bin" / "python3"
+
+    if venv_python.exists():
+        python_path = str(venv_python)
+    else:
+        python_path = "python3"
+
+    subprocess.Popen(
+        [python_path, str(server_script)],
+        cwd=str(MOBILE_CLAUDE_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+    # Get Tailscale IP
+    try:
+        result = subprocess.run(
+            ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            ts_ip = result.stdout.strip()
+            print(f"Mobile server started: http://{ts_ip}:8080", file=sys.stderr)
+        else:
+            print("Mobile server started on port 8080", file=sys.stderr)
+    except Exception:
+        print("Mobile server started on port 8080", file=sys.stderr)
+
+    return True
+
+
+def list_tmux_sessions():
+    """List all tmux sessions."""
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return [s.strip() for s in result.stdout.strip().split('\n') if s.strip()]
+    return []
+
+
+def get_tmux_pane_content(session_name, lines=50):
+    """Get content from a tmux session's pane.
+
+    Args:
+        session_name: Name of the tmux session
+        lines: Number of lines to capture (default 50)
+
+    Returns:
+        String content of the pane, or empty string on error
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
+def is_claude_running_in_tmux(session_name):
+    """Check if Claude is running in a tmux session.
+
+    Returns: (running: bool, status: str)
+        - running: True if Claude appears to be running
+        - status: 'idle', 'working', 'not_running', 'asking_question', etc.
+    """
+    content = get_tmux_pane_content(session_name)
+    if not content:
+        return False, 'unknown'
+
+    status = get_claude_status(content)
+
+    # Claude is running if status is anything except 'not_running'
+    running = status not in ('not_running', 'unknown')
+    return running, status
+
+
+def start_claude_in_tmux(session_name, wait_for_ready=True, timeout=10):
+    """Start Claude in a tmux session.
+
+    Args:
+        session_name: Name of the tmux session
+        wait_for_ready: If True, wait for Claude to be ready for input
+        timeout: Max seconds to wait for Claude to start
+
+    Returns: (success: bool, message: str)
+    """
+    # Send the claude command
+    result = subprocess.run(
+        ["tmux", "send-keys", "-t", session_name, "claude", "Enter"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return False, f"Failed to send command: {result.stderr}"
+
+    if not wait_for_ready:
+        return True, "Started Claude (not waiting for ready)"
+
+    # Wait for Claude to be ready
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        time.sleep(0.5)
+        running, status = is_claude_running_in_tmux(session_name)
+        if running and status == 'idle':
+            return True, "Claude started and ready"
+        if running and status == 'working':
+            # Claude is starting up
+            continue
+
+    return True, "Claude started (may still be initializing)"
+
+
+
+
+def is_tmux_pane_active(session_name):
+    """Check if a tmux session's pane is currently active (focused).
+
+    Returns True if active (user might be typing), False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_active}"],
+            capture_output=True, text=True, timeout=2
+        )
+        return result.returncode == 0 and result.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
+def send_via_msg(target, text, force=False, raw=False, queue=False):
+    """Send text to target session via msg tool (single transport layer).
+
+    Args:
+        target: Project/session name
+        text: Text to send
+        force: Force send even if window active
+        raw: If True, send raw text (--prompt); if False, use envelope format
+        queue: If True, force queue instead of live delivery
+
+    Returns: (success: bool, message: str, queued: bool)
+    """
+    msg_tool = MSG_TOOL
+    cmd = [str(msg_tool), target]
+    if raw:
+        cmd.append("--prompt")
+    if force:
+        cmd.append("--force")
+    if queue:
+        cmd.append("--queue")
+    cmd.append(text)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        output = result.stderr.strip()
+
+        if "Queued (window active)" in output:
+            return True, "Queued (window active)", True
+        elif "Queued (input detected)" in output:
+            return True, "Queued (input detected)", True
+        elif "Queued for" in output:
+            return True, "Queued (offline)", True
+        elif queue or "Queued" in output:
+            return True, "Queued", True
+        elif "Sent" in output:
+            return True, "Sent", False
+        else:
+            return result.returncode == 0, output or "Unknown result", False
+    except subprocess.TimeoutExpired:
+        return False, "Timeout", False
+    except Exception as e:
+        return False, str(e), False
+
+
+def clear_session_context(target, force=False):
+    """Send /clear to a session to reset context (fresh start).
+
+    Args:
+        target: Project/session name (tmux session or iTerm profile)
+        force: Force send even if window active
+
+    Returns: (success: bool, message: str)
+    """
+    # Send /clear command (raw - no envelope for slash commands)
+    success, msg, queued = send_via_msg(target, "/clear", force=force, raw=True)
+    if not success:
+        return False, f"Failed to send /clear: {msg}"
+
+    if queued:
+        # Message was queued - can't wait for confirmation
+        return True, "Queued /clear (will execute when session ready)"
+
+    # Wait briefly for /clear to take effect
+    time.sleep(0.8)
+    return True, "Context cleared"
+
+
+def get_session_content(profile_name):
+    """Get terminal content for a session by profile name."""
+    script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    return contents of s
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return ""
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
+def is_claude_idle(content):
+    """Check if Claude is idle based on terminal content.
+
+    Claude shows '>' prompt when waiting for input.
+    When working, shows spinners/progress indicators.
+    """
+    if not content:
+        return False
+
+    lines = content.strip().split('\n')
+    if not lines:
+        return False
+
+    # Get last few non-empty lines
+    last_lines = [l.strip() for l in lines[-10:] if l.strip()]
+    if not last_lines:
+        return False
+
+    last_line = last_lines[-1]
+
+    # Claude idle prompt patterns
+    # The prompt is typically just ">" possibly with ANSI codes
+    # Also check for shell prompt (if Claude exited)
+    idle_patterns = [
+        r'^>$',           # Just >
+        r'^>\s*$',        # > with trailing space
+        r'^\x1b\[.*>',    # > with ANSI prefix
+        r'>.*\x1b\[0m$',  # > with ANSI suffix
+        r'^\$\s*$',       # Shell $ prompt (Claude not running)
+        r'^%\s*$',        # Shell % prompt (zsh)
+    ]
+
+    for pattern in idle_patterns:
+        if re.search(pattern, last_line):
+            return True
+
+    # Also check for common idle indicators in content
+    # If we see recent ">" prompts without subsequent activity
+    return last_line.endswith('>') or last_line == '>'
+
+
+def get_claude_status(content):
+    """Determine Claude status from terminal content.
+
+    Returns: 'idle', 'working', 'not_running', 'asking_question', 'blocked:permission'
+
+    States:
+    - working: Model is processing (spinner visible)
+    - asking_question: Claude is asking user a question (selection UI)
+    - blocked:permission: Waiting for permission (TODO: implement later)
+    - idle: Ready for new input
+    - not_running: Shell prompt visible, Claude not running
+    """
+    if not content:
+        return 'unknown'
+
+    lines = content.strip().split('\n')
+    if not lines:
+        return 'unknown'
+
+    # Get last 20 lines for analysis (skip status bar at very bottom)
+    last_lines = [l.strip() for l in lines[-20:] if l.strip()]
+    if not last_lines:
+        return 'unknown'
+
+    # Strip ANSI codes from recent content
+    recent_content = '\n'.join(last_lines)
+    clean_recent = re.sub(r'\x1b\[[0-9;]*m', '', recent_content)
+
+    # Check for shell prompt (Claude not running)
+    last_line = re.sub(r'\x1b\[[0-9;]*m', '', last_lines[-1])
+    if re.search(r'[\$%#]\s*$', last_line):
+        return 'not_running'
+
+    # 1. WORKING: Check for spinner characters (braille dots)
+    spinners = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    for spinner in spinners:
+        if spinner in clean_recent:
+            return 'working'
+
+    # Also check for ✱ with ... (action in progress)
+    if '✱' in clean_recent and '...' in clean_recent:
+        return 'working'
+
+    # 2. ASKING QUESTION: Selection UI visible
+    # Pattern: "Enter to select · ↑/↓ to navigate" (AskUserQuestion)
+    if 'Enter to select' in clean_recent and '↑/↓' in clean_recent:
+        return 'asking_question'
+    # Pattern: "Do you want to proceed?" — only if in last 5 lines (permission/plan approval)
+    last_5 = '\n'.join(last_lines[-5:])
+    clean_last_5 = re.sub(r'\x1b\[[0-9;]*m', '', last_5)
+    if 'Do you want to proceed?' in clean_last_5:
+        return 'asking_question'
+
+    # 3. BLOCKED: Permission prompt or plan approval
+    if "don't ask again" in clean_recent:
+        return 'blocked:permission'
+    if 'auto-accept edits' in clean_recent or 'manually approve edits' in clean_recent:
+        return 'blocked:permission'
+
+    # 4. IDLE: Everything else when Claude is running
+    # Check for idle prompt or model name in status bar
+    if is_claude_idle(content):
+        return 'idle'
+
+    # Model names in status bar = idle
+    if re.search(r'(Opus|Sonnet|Haiku)', clean_recent):
+        return 'idle'
+
+    return 'unknown'
+
+
+def get_claude_status_with_stability(profile_name, wait_seconds=1.5):
+    """Determine Claude status using content stability check.
+
+    Reads terminal twice with delay - if unchanged, definitely idle.
+    Returns: 'idle', 'working', 'not_running', or 'unknown'
+    """
+    content1 = get_session_content(profile_name)
+    status1 = get_claude_status(content1)
+
+    # If already clearly not running or idle prompt detected, quick return
+    if status1 == 'not_running':
+        return status1
+
+    # Wait and check again for stability
+    time.sleep(wait_seconds)
+    content2 = get_session_content(profile_name)
+    status2 = get_claude_status(content2)
+
+    # If content unchanged (or nearly so), it's idle
+    # Strip ANSI codes for comparison
+    def strip_ansi(s):
+        return re.sub(r'\x1b\[[0-9;]*m', '', s)
+
+    c1_clean = strip_ansi(content1).strip()
+    c2_clean = strip_ansi(content2).strip()
+
+    # Compare last 500 chars (recent output)
+    if c1_clean[-500:] == c2_clean[-500:]:
+        # Content stable - trust the status detection
+        # (asking_question is also stable - UI doesn't change while waiting)
+        if status2 in ('not_running', 'asking_question', 'blocked:permission'):
+            return status2
+        return 'idle'  # Stable + no special state = idle
+
+    # Content changed - Claude is working
+    return 'working'
+
+
+def close_session(profile_name):
+    """Close iTerm2 session by profile name."""
+    script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    close s
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return false
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_to_session(profile_name, text):
+    """Send text to a session by profile name using iTerm2 write text."""
+    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    tell s to write text "{escaped_text}"
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return false
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def activate_session(profile_name):
+    """Activate/focus the iTerm2 window with given profile."""
+    script = f'''
+tell application "iTerm2"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    select s
+                    set frontmost of w to true
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return false
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_keystroke(text, with_enter=True):
+    """Send keystrokes via System Events (simulates real typing)."""
+    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    enter_part = 'keystroke return' if with_enter else ''
+    script = f'''
+tell application "System Events"
+    keystroke "{escaped_text}"
+    {enter_part}
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_special_key(key_name):
+    """Send special key via System Events.
+
+    key_name: 'escape', 'return', 'tab'
+    """
+    key_codes = {
+        'escape': 53,
+        'return': 36,
+        'tab': 48,
+    }
+    if key_name not in key_codes:
+        return False
+
+    script = f'''
+tell application "System Events"
+    key code {key_codes[key_name]}
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_ctrl_c():
+    """Send Ctrl+C via System Events."""
+    script = '''
+tell application "System Events"
+    keystroke "c" using control down
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_to_current_session(text):
+    """Send text to current iTerm2 session (with newline)."""
+    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    script = f'''
+tell application "iTerm2"
+    tell current session of current window
+        write text "{escaped_text}"
+    end tell
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_to_current_session_raw(chars):
+    """Send raw characters to current iTerm2 session (no newline).
+
+    Use for control characters like ESC (\\x1b) or Ctrl+C (\\x03).
+    """
+    # Convert Python escape sequences to AppleScript
+    char_list = []
+    for c in chars:
+        char_list.append(f'ASCII character {ord(c)}')
+    char_expr = ' & '.join(char_list) if char_list else '""'
+
+    script = f'''
+tell application "iTerm2"
+    tell current session of current window
+        write text ({char_expr}) newline NO
+    end tell
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def restart_claude_session(profile_name, force=False, quick=False):
+    """Restart Claude in a session.
+
+    Args:
+        profile_name: iTerm2 profile name
+        force: Force restart even if Claude appears to be working
+        quick: Skip stability check (faster but less accurate)
+
+    Returns: (success: bool, message: str)
+    """
+    if quick:
+        content = get_session_content(profile_name)
+        status = get_claude_status(content)
+    else:
+        # Use stability check - more reliable
+        print(f"  Checking {profile_name}...", file=sys.stderr, end=" ", flush=True)
+        status = get_claude_status_with_stability(profile_name)
+
+    if status == 'working' and not force:
+        return False, f"Claude is working - skipping (use --force to override)"
+
+    if status == 'not_running':
+        # Just start Claude
+        send_to_session(profile_name, "claude")
+        return True, "Started Claude (wasn't running)"
+
+    if status in ['idle', 'unknown'] or force:
+        # Step 1: Send ESC + Ctrl+C to quit Claude
+        quit_script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    tell s to write text (ASCII character 27) newline NO
+                    delay 0.1
+                    tell s to write text (ASCII character 3) newline NO
+                    delay 0.2
+                    tell s to write text (ASCII character 3) newline NO
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+        subprocess.run(["osascript", "-e", quit_script], capture_output=True, timeout=5)
+
+        # Step 2: Poll until shell prompt detected (max 5 seconds)
+        for _ in range(10):
+            time.sleep(0.5)
+            content = get_session_content(profile_name)
+            if content:
+                lines = content.strip().split('\n')
+                last_line = lines[-1].strip() if lines else ""
+                # Shell prompt patterns
+                if re.search(r'[$%#>]\s*$', last_line) and 'claude' not in last_line.lower():
+                    break
+
+        # Step 3: Start Claude
+        send_to_session(profile_name, "claude")
+        return True, "Restarted Claude"
+
+    return False, f"Unknown status: {status}"
+
+
+def send_prompt_to_session(profile_name, prompt, force=False):
+    """Start/restart Claude and send a prompt.
+
+    Args:
+        profile_name: iTerm2 profile name
+        prompt: Text to send after Claude starts
+        force: Force restart even if working
+
+    Returns: (success: bool, message: str)
+    """
+    # Check current status
+    print(f"  Checking {profile_name}...", file=sys.stderr, end=" ", flush=True)
+    content = get_session_content(profile_name)
+    status = get_claude_status(content)
+    print(status, file=sys.stderr)
+
+    if status == 'working' and not force:
+        return False, "Claude is working - use --force to override"
+
+    if status == 'not_running':
+        # Fresh session - write prompt to temp file, start Claude with it
+        print(f"  Starting Claude with prompt (fresh session)...", file=sys.stderr)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+        send_to_session(profile_name, f"claude \"$(cat '{prompt_file}')\" && rm '{prompt_file}'")
+        return True, f"Started Claude with prompt"
+    elif status in ['idle', 'unknown']:
+        # Claude is running but idle - restart with prompt for reliability
+        print(f"  Restarting Claude with prompt...", file=sys.stderr)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+        # Exit current Claude (Ctrl+C twice) and restart with prompt
+        script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    tell s to write text (ASCII character 3) newline NO
+                    delay 0.3
+                    tell s to write text (ASCII character 3) newline NO
+                    delay 1.5
+                    tell s to write text "claude \\"$(cat '{prompt_file}')\\" && rm '{prompt_file}'"
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        return True, f"Restarted Claude with prompt"
+    elif force:
+        # Force restart requested
+        success, msg = restart_claude_session(profile_name, force=True, quick=True)
+        print(f"  Waiting for Claude to restart...", file=sys.stderr)
+        time.sleep(3)
+
+    # Fallback: send prompt directly (single line only)
+    escaped_prompt = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+    script = f'''
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is "{profile_name}" then
+                    tell s to write text "{escaped_prompt}"
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return false
+end tell
+'''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return True, f"Sent prompt to {profile_name}"
+        return False, f"AppleScript error: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout sending prompt"
+
+
+def show_status(quick=False):
+    """Show status of all open project windows.
+
+    Args:
+        quick: If True, skip stability check (faster but less accurate)
+    """
+    existing = get_existing_profiles()
+    registry = load_projects_registry()
+
+    if not existing:
+        print("No project windows open.", file=sys.stderr)
+        return
+
+    project_profiles = [p for p in existing
+                       if p in registry or p.lower() in [r.lower() for r in registry]]
+
+    if not project_profiles:
+        print("No project windows open (found non-project profiles only).", file=sys.stderr)
+        return
+
+    if not quick:
+        print(f"Checking {len(project_profiles)} project(s) for stability (~1.5s each)...", file=sys.stderr)
+
+    print(f"\n{'Project':<20} {'Status':<12} {'Last Line'}", file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
+
+    for profile in project_profiles:
+        if quick:
+            content = get_session_content(profile)
+            status = get_claude_status(content)
+        else:
+            status = get_claude_status_with_stability(profile)
+            content = get_session_content(profile)  # Re-get for display
+
+        # Get last meaningful line for display (skip statusbar, accept edits, etc.)
+        lines = [l.strip() for l in content.split('\n') if l.strip()]
+        # Strip ANSI codes from all lines
+        clean_lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
+        # Skip known UI lines from the bottom
+        skip_patterns = [
+            r'^⏵⏵',           # accept edits line
+            r'^Opus|^Sonnet|^Haiku',  # model statusbar
+            r'^>',             # user prompt
+            r'shift\+tab',     # hint line
+            r'^[-─━═]+$',      # horizontal separators
+            r'^[│┃|]+$',       # vertical separators
+            r'^\s*$',          # whitespace only
+        ]
+        display_line = "(empty)"
+        for line in reversed(clean_lines[-10:]):
+            skip = False
+            for pattern in skip_patterns:
+                if re.search(pattern, line):
+                    skip = True
+                    break
+            if not skip and len(line) > 5:
+                display_line = line[:40]
+                break
+        last_line = display_line
+
+        # Status display
+        status_display = {
+            'idle': '✓ idle',
+            'working': '⚡ working',
+            'not_running': '○ shell',
+            'asking_question': '? question',
+            'blocked:permission': '⏸ perms',
+            'unknown': '? unknown'
+        }.get(status, status)
+
+        print(f"{profile:<20} {status_display:<12} {last_line}", file=sys.stderr)
+
+
+def tile_windows():
+    """Run TileITerm.app to arrange windows."""
+    if TILE_APP.exists():
+        subprocess.run(["open", str(TILE_APP)], capture_output=True)
+
+
+def resolve_projects(names):
+    """Resolve project names to (name, profile_name, path) tuples."""
+    resolved = []
+    for name in names:
+        matches = search_project(name)
+        if not matches:
+            print(f"Not found: {name}", file=sys.stderr)
+            continue
+        if len(matches) > 1:
+            # Use first match but warn
+            print(f"Multiple matches for '{name}': {[m['name'] for m in matches]}, using {matches[0]['name']}", file=sys.stderr)
+        proj = matches[0]
+        profile_name = proj['name']  # Profile name = project name (no prefix)
+        project_path = proj.get('path', str(Path.home()))
+        resolved.append((proj['name'], profile_name, project_path))
+    return resolved
+
+
+def get_projects_from_memory(since="yesterday"):
+    """Get projects from memory system based on date.
+
+    Args:
+        since: Date string like "yesterday", "3 days ago", "2026-01-10"
+
+    Returns:
+        List of project names found in memory
+    """
+    try:
+        # Memory tool is optional - look for it in common locations
+        memory_tool = None
+        for loc in ['~/.local/bin/memory', '~/Tools/memory']:
+            path = Path(loc).expanduser()
+            if path.exists():
+                memory_tool = path
+                break
+        if not memory_tool:
+            return []
+
+        result = subprocess.run(
+            [str(memory_tool), "projects", "--since", since],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return []
+
+        # Parse output: "  project-name: N memories"
+        projects = []
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if ':' in line and 'memories' in line:
+                proj_name = line.split(':')[0].strip()
+                if proj_name:
+                    projects.append(proj_name)
+        return projects
+    except Exception:
+        return []
+
+
+def get_projects_by_date(since="yesterday", use_memory=True):
+    """Get projects from both registry and memory for a date range.
+
+    Args:
+        since: Date string like "yesterday", "3 days ago", "2026-01-10"
+        use_memory: Also check memory system
+
+    Returns:
+        List of unique project names
+    """
+    registry = load_projects_registry()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Parse 'since' to get target date(s)
+    if since == "yesterday":
+        target_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        registry_projects = [name for name, info in registry.items()
+                            if info.get("last_accessed") == target_date]
+    elif "days ago" in since:
+        days = int(since.split()[0])
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        registry_projects = [name for name, info in registry.items()
+                            if info.get("last_accessed", "") >= cutoff
+                            and info.get("last_accessed", "") != today]
+    else:
+        # Assume it's a date like "2026-01-10"
+        registry_projects = [name for name, info in registry.items()
+                            if info.get("last_accessed") == since]
+
+    # Get from memory
+    memory_projects = get_projects_from_memory(since) if use_memory else []
+
+    # Merge and deduplicate, preserving order (registry first)
+    seen = set()
+    result = []
+    for p in registry_projects + memory_projects:
+        p_lower = p.lower()
+        if p_lower not in seen:
+            seen.add(p_lower)
+            # Use registry name if exists, else memory name
+            if p in registry:
+                result.append(p)
+            else:
+                # Find matching registry name (case-insensitive)
+                match = next((n for n in registry if n.lower() == p_lower), None)
+                if match:
+                    result.append(match)
+                else:
+                    result.append(p)  # Memory-only project
+
+    return result
+
+
+def get_yesterday_projects(fallback_to_recent=True):
+    """Get projects accessed yesterday, or most recent if none found.
+
+    Args:
+        fallback_to_recent: If True and no yesterday projects, return most recent day's projects
+    """
+    # First try combined registry + memory
+    projects = get_projects_by_date("yesterday", use_memory=True)
+    if projects:
+        return projects
+
+    if not fallback_to_recent:
+        return []
+
+    # Fallback: find most recent working day from registry
+    registry = load_projects_registry()
+    today = datetime.now().strftime("%Y-%m-%d")
+    dates_to_projects = {}
+    for name, info in registry.items():
+        date = info.get("last_accessed", "")
+        if date and date != today:
+            if date not in dates_to_projects:
+                dates_to_projects[date] = []
+            dates_to_projects[date].append(name)
+
+    if not dates_to_projects:
+        print("No previous sessions found.", file=sys.stderr)
+        return []
+
+    # Get most recent date
+    most_recent_date = max(dates_to_projects.keys())
+    projects = dates_to_projects[most_recent_date]
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    print(f"No projects on {yesterday}, using {most_recent_date} ({len(projects)} projects)", file=sys.stderr)
+    return projects
+
+
+def get_recent_projects(n):
+    """Get N most recently accessed projects."""
+    registry = load_projects_registry()
+    # Sort by last_accessed descending
+    sorted_projects = sorted(
+        registry.items(),
+        key=lambda x: x[1].get("last_accessed", "1970-01-01"),
+        reverse=True
+    )
+    return [name for name, _ in sorted_projects[:n]]
+
+
+def save_default(names):
+    """Save project names as default set."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DEFAULT_FILE, "w") as f:
+        json.dump({"projects": names}, f, indent=2)
+    print(f"Saved default: {names}", file=sys.stderr)
+
+
+def load_default():
+    """Load default project set."""
+    if DEFAULT_FILE.exists():
+        with open(DEFAULT_FILE) as f:
+            data = json.load(f)
+            return data.get("projects", [])
+    return []
+
+
+def main():
+    args = sys.argv[1:]
+    project_names = []
+    save_as_default = False
+    restart_mode = False
+    restart_all = False
+    status_mode = False
+    prompt_mode = False
+    prompt_text = None
+    force = False
+    quick = False
+    dry_run = False
+    tmux_mode = True  # Default to tmux for single-instance + mobile access
+    mobile_mode = False
+    no_tmux = False  # Flag to explicitly disable tmux
+    report_back = True  # Auto-append msg callback instruction (use --no-report to disable)
+    attach_mode = False  # Reopen iTerm window for existing tmux session
+    continue_mode = False  # If True, continue existing context; if False, /clear first (default)
+    inline_prompt = None  # For "op project prompt" syntax
+
+    # Quick check for simple "op project prompt/file" syntax
+    # Pattern: op <name> <something that's not a flag>
+    if len(args) >= 2 and not args[0].startswith("-") and not args[1].startswith("-"):
+        # Could be: op project "prompt" OR op project file.md
+        potential_prompt = args[1]
+        # Check if it's a file path
+        expanded_path = Path(potential_prompt).expanduser()
+        if expanded_path.exists() and expanded_path.is_file():
+            # It's a file - read it
+            inline_prompt = expanded_path.read_text().strip()
+        else:
+            # Treat as prompt text
+            inline_prompt = potential_prompt
+        # Only use first arg as project name
+        args = [args[0]] + args[2:]  # Remove the prompt from args
+
+    # Parse arguments
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--yesterday":
+            project_names.extend(get_yesterday_projects())
+        elif arg == "--since":
+            if i + 1 < len(args):
+                since_arg = args[i + 1]
+                project_names.extend(get_projects_by_date(since_arg))
+                i += 1
+            else:
+                print("--since requires a date like '3 days ago'", file=sys.stderr)
+                sys.exit(1)
+        elif arg == "--date":
+            if i + 1 < len(args):
+                date_arg = args[i + 1]
+                project_names.extend(get_projects_by_date(date_arg))
+                i += 1
+            else:
+                print("--date requires a date like '2026-01-10'", file=sys.stderr)
+                sys.exit(1)
+        elif arg == "--recent":
+            if i + 1 < len(args):
+                try:
+                    n = int(args[i + 1])
+                    project_names.extend(get_recent_projects(n))
+                    i += 1
+                except ValueError:
+                    print("--recent requires a number", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print("--recent requires a number", file=sys.stderr)
+                sys.exit(1)
+        elif arg == "--save-default":
+            save_as_default = True
+        elif arg == "--default":
+            project_names.extend(load_default())
+        elif arg == "--restart":
+            restart_mode = True
+        elif arg == "--restart-all":
+            restart_all = True
+        elif arg == "--status":
+            status_mode = True
+        elif arg == "--prompt":
+            prompt_mode = True
+            # Next arg is project name, then prompt text
+            if i + 2 < len(args):
+                project_names.append(args[i + 1])
+                prompt_text = args[i + 2]
+                i += 2
+            else:
+                print("--prompt requires <project> and \"prompt text\"", file=sys.stderr)
+                sys.exit(1)
+        elif arg == "--prompt-file":
+            prompt_mode = True
+            # Next arg is project name, then file path
+            if i + 2 < len(args):
+                project_names.append(args[i + 1])
+                prompt_file = Path(args[i + 2]).expanduser()
+                if not prompt_file.exists():
+                    print(f"Prompt file not found: {prompt_file}", file=sys.stderr)
+                    sys.exit(1)
+                prompt_text = prompt_file.read_text().strip()
+                i += 2
+            else:
+                print("--prompt-file requires <project> and <file>", file=sys.stderr)
+                sys.exit(1)
+        elif arg == "--force" or arg == "-f":
+            force = True
+        elif arg == "--quick" or arg == "-q":
+            quick = True
+        elif arg == "--dry-run" or arg == "-n":
+            dry_run = True
+        elif arg == "--tmux":
+            tmux_mode = True
+        elif arg == "--no-tmux":
+            tmux_mode = False
+            no_tmux = True
+        elif arg == "--mobile":
+            tmux_mode = True  # --mobile implies --tmux
+            mobile_mode = True
+        elif arg == "--report":
+            report_back = True
+        elif arg == "--no-report":
+            report_back = False
+        elif arg == "--attach" or arg == "-a":
+            attach_mode = True
+        elif arg == "--continue" or arg == "-c":
+            continue_mode = True
+        elif arg == "--help" or arg == "-h":
+            print(__doc__, file=sys.stderr)
+            sys.exit(0)
+        elif not arg.startswith("-"):
+            project_names.append(arg)
+        i += 1
+
+    # Handle status mode
+    if status_mode:
+        show_status(quick=quick)
+        return
+
+    # Handle restart-all mode
+    if restart_all:
+        existing = get_existing_profiles()
+        registry = load_projects_registry()
+
+        if not existing:
+            print("No project windows open.", file=sys.stderr)
+            return
+
+        project_profiles = [p for p in existing
+                           if p in registry or p.lower() in [r.lower() for r in registry]]
+
+        if not project_profiles:
+            print("No project windows found.", file=sys.stderr)
+            return
+
+        restarted = 0
+        for profile in project_profiles:
+            success, msg = restart_claude_session(profile, force=force, quick=quick)
+            status_icon = "✓" if success else "✗"
+            print(f"{status_icon} {profile}: {msg}", file=sys.stderr)
+            if success:
+                restarted += 1
+                time.sleep(0.3)  # Small delay between restarts
+
+        print(f"\nRestarted {restarted}/{len(project_profiles)} sessions.", file=sys.stderr)
+        return
+
+    # Handle prompt mode (start Claude and send prompt)
+    if prompt_mode:
+        if not project_names or not prompt_text:
+            print("--prompt requires <project> and \"prompt text\"", file=sys.stderr)
+            sys.exit(1)
+
+        resolved = resolve_projects(project_names)
+        existing = get_existing_profiles()
+
+        for proj_name, profile_name, _ in resolved:
+            if profile_name not in existing:
+                print(f"✗ {proj_name}: Not open - open it first with: open-projects {proj_name}", file=sys.stderr)
+                continue
+
+            success, msg = send_prompt_to_session(profile_name, prompt_text, force=force)
+            status_icon = "✓" if success else "✗"
+            print(f"{status_icon} {proj_name}: {msg}", file=sys.stderr)
+        return
+
+    # Handle restart mode (specific projects)
+    if restart_mode:
+        if not project_names:
+            print("--restart requires project names", file=sys.stderr)
+            sys.exit(1)
+
+        resolved = resolve_projects(project_names)
+        existing = get_existing_profiles()
+
+        restarted = 0
+        for proj_name, profile_name, _ in resolved:
+            if profile_name not in existing:
+                print(f"✗ {proj_name}: Not open", file=sys.stderr)
+                continue
+
+            success, msg = restart_claude_session(profile_name, force=force, quick=quick)
+            status_icon = "✓" if success else "✗"
+            print(f"{status_icon} {proj_name}: {msg}", file=sys.stderr)
+            if success:
+                restarted += 1
+                time.sleep(0.3)
+
+        print(f"\nRestarted {restarted}/{len(resolved)} sessions.", file=sys.stderr)
+        return
+
+    # No args = load default
+    if not project_names and not save_as_default:
+        project_names = load_default()
+        if not project_names:
+            print("No projects specified and no default saved.", file=sys.stderr)
+            print("Usage: open-projects <name>... or open-projects --save-default <name>...", file=sys.stderr)
+            sys.exit(1)
+
+    # Save default if requested (before resolution, save raw names)
+    if save_as_default:
+        # Get only the non-flag arguments for saving
+        raw_names = [a for a in args if not a.startswith("-") and a != "--save-default"]
+        save_default(raw_names)
+        if not project_names:
+            # Just saving, not opening
+            return
+
+    # Resolve projects
+    resolved = resolve_projects(project_names)
+    if not resolved:
+        print("No projects to open.", file=sys.stderr)
+        sys.exit(1)
+
+    # Start mobile server if requested
+    if mobile_mode:
+        start_mobile_server()
+
+    # Get existing windows (for non-tmux mode) or tmux sessions (for tmux mode)
+    if tmux_mode:
+        existing_sessions = list_tmux_sessions()
+    existing_profiles = get_existing_profiles()
+
+    # Open windows
+    opened = 0
+    prompt_sent = False  # Track if inline_prompt already sent in loop
+    for proj_name, profile_name, project_path in resolved:
+        if tmux_mode:
+            # In tmux mode, check for existing tmux session
+            safe_name = re.sub(r'[^a-zA-Z0-9_-]', '-', proj_name).lower()
+            if safe_name in existing_sessions:
+                if not attach_mode:
+                    if not dry_run:
+                        update_last_accessed(proj_name)
+                        # Send inline prompt to already-open tmux session via msg
+                        if inline_prompt:
+                            # Don't open window - msg sends directly to tmux session
+                            # Use -a flag to open/focus window explicitly
+                            print(f"Session exists: {proj_name}", file=sys.stderr)
+                            # Append report-back instruction if enabled
+                            prompt_to_send = inline_prompt
+                            if report_back:
+                                source = os.environ.get("TMUX", "")
+                                if source:
+                                    try:
+                                        result = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                                                              capture_output=True, text=True)
+                                        source = result.stdout.strip() if result.returncode == 0 else Path.cwd().name
+                                    except Exception:
+                                        source = Path.cwd().name
+                                else:
+                                    source = Path.cwd().name
+                                prompt_to_send += f'\n\nWhen complete, send summary: msg {source} "Task done: <one-line summary>"'
+                            # Let msg handle delivery-or-queue logic
+                            # Send /clear first for fresh context (unless -c/--continue)
+                            if not continue_mode:
+                                send_via_msg(safe_name, "/clear", raw=True, force=force)
+
+                            print(f"Sending prompt to {proj_name}...", file=sys.stderr)
+                            success, msg, queued = send_via_msg(safe_name, prompt_to_send, force=force)
+                            status_icon = "✓" if success else "✗"
+                            mode_hint = " (continued)" if continue_mode else " (fresh)"
+                            queue_hint = " (queued)" if queued else ""
+                            print(f"{status_icon} {proj_name}: {msg}{mode_hint}{queue_hint}", file=sys.stderr)
+                            prompt_sent = True
+                        else:
+                            # No prompt - just skip
+                            print(f"Skip (tmux session exists, use -a to attach): {proj_name}", file=sys.stderr)
+                    continue
+                else:
+                    # Attach mode: open iTerm window attached to existing session
+                    # But first check if iTerm window already exists for this profile
+                    if profile_name in existing_profiles:
+                        print(f"Focusing existing window: {proj_name}", file=sys.stderr)
+                        if not dry_run:
+                            activate_session(profile_name)
+                            update_last_accessed(proj_name)
+                        continue
+                    if dry_run:
+                        print(f"Would attach to: {proj_name}", file=sys.stderr)
+                    else:
+                        print(f"Attaching to: {proj_name}", file=sys.stderr)
+                        open_iterm_with_tmux(proj_name, project_path, profile_name)
+                        update_last_accessed(proj_name)
+                    opened += 1
+                    continue
+        else:
+            # Normal mode - check for existing iTerm profile
+            if profile_name in existing_profiles:
+                print(f"Skip (already open): {proj_name}", file=sys.stderr)
+                if not dry_run:
+                    update_last_accessed(proj_name)
+                    # Send inline prompt to already-open project via msg
+                    if inline_prompt:
+                        # Append report-back instruction if enabled
+                        prompt_to_send = inline_prompt
+                        if report_back:
+                            source = os.environ.get("TMUX", "")
+                            if source:
+                                try:
+                                    result = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                                                          capture_output=True, text=True)
+                                    source = result.stdout.strip() if result.returncode == 0 else Path.cwd().name
+                                except Exception:
+                                    source = Path.cwd().name
+                            else:
+                                source = Path.cwd().name
+                            prompt_to_send += f'\n\nWhen complete, send summary: msg {source} "Task done: <one-line summary>"'
+                        # Let msg handle delivery-or-queue logic
+                        # Send /clear first for fresh context (unless -c/--continue)
+                        if not continue_mode:
+                            send_via_msg(profile_name, "/clear", raw=True, force=force)
+
+                        print(f"Sending prompt to {proj_name}...", file=sys.stderr)
+                        success, msg, queued = send_via_msg(profile_name, prompt_to_send, force=force)
+                        status_icon = "✓" if success else "✗"
+                        mode_hint = " (continued)" if continue_mode else " (fresh)"
+                        queue_hint = " (queued)" if queued else ""
+                        print(f"{status_icon} {proj_name}: {msg}{mode_hint}{queue_hint}", file=sys.stderr)
+                        prompt_sent = True
+                continue
+
+        if dry_run:
+            mode_str = " (tmux)" if tmux_mode else ""
+            print(f"Would open{mode_str}: {proj_name}", file=sys.stderr)
+        else:
+            if tmux_mode:
+                print(f"Opening (tmux): {proj_name}", file=sys.stderr)
+                open_iterm_with_tmux(proj_name, project_path, profile_name)
+            else:
+                print(f"Opening: {proj_name}", file=sys.stderr)
+                open_iterm_window(profile_name)
+            update_last_accessed(proj_name)
+        opened += 1
+
+    # Tile windows
+    if opened > 0:
+        if dry_run:
+            print(f"Would open {opened} window(s).", file=sys.stderr)
+        else:
+            tile_windows()
+            mode_str = " (tmux)" if tmux_mode else ""
+            print(f"Opened {opened} window(s){mode_str}, tiled.", file=sys.stderr)
+    else:
+        print("All projects already open.", file=sys.stderr)
+
+    # Handle inline prompt (op project "prompt" syntax)
+    if inline_prompt and resolved and not prompt_sent:
+        # Wait for window to be ready
+        time.sleep(1.5)
+        proj_name, profile_name, _ = resolved[0]
+        # Get tmux session name for msg
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '-', proj_name).lower()
+        target = safe_name if tmux_mode else profile_name
+
+        # Append report-back instruction (default on, use --no-report to disable)
+        if report_back:
+            # Get source project name
+            source = os.environ.get("TMUX", "")
+            if source:
+                try:
+                    result = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                                          capture_output=True, text=True)
+                    source = result.stdout.strip() if result.returncode == 0 else Path.cwd().name
+                except Exception:
+                    source = Path.cwd().name
+            else:
+                source = Path.cwd().name
+            inline_prompt += f'\n\nWhen complete, send summary: msg {source} "Task done: <one-line summary>"'
+
+        # Let msg handle delivery-or-queue logic
+        # New windows don't need /clear - they start fresh
+        print(f"Sending prompt to {proj_name}...", file=sys.stderr)
+        success, msg, queued = send_via_msg(target, inline_prompt, force=force)
+        status_icon = "✓" if success else "✗"
+        queue_hint = " (queued)" if queued else ""
+        print(f"{status_icon} {proj_name}: {msg} (fresh){queue_hint}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

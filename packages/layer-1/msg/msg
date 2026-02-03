@@ -1,0 +1,222 @@
+#!/bin/bash
+# Inter-session messaging via tmux
+# Usage: msg <project> "message"
+#        msg <project> --question "need help with X"
+#        msg <project> --blocked "waiting for API key"
+#        msg <project> --prompt "raw text" (for op delegation, no formatting)
+#        msg <project> --queue "offline message" (queues for later)
+
+set -e
+
+INBOX_DIR="$HOME/.claude/inbox"
+
+# Source shared pane detection utilities
+# PANE_STATUS can be set to override default location
+PANE_STATUS="${PANE_STATUS:-}"
+if [ -z "$PANE_STATUS" ]; then
+    # Try common locations
+    for loc in "$HOME/.local/bin/pane-status" "$HOME/Tools/pane-status" "$(dirname "$0")/../layer-0/pane-status/pane-status"; do
+        if [ -f "$loc" ]; then
+            PANE_STATUS="$loc"
+            break
+        fi
+    done
+fi
+if [ -z "$PANE_STATUS" ] || [ ! -f "$PANE_STATUS" ]; then
+    echo "Error: pane-status not found. Set PANE_STATUS env var." >&2
+    exit 1
+fi
+source "$PANE_STATUS"
+
+# Escape string for JSON (handles quotes, backslashes, newlines, tabs)
+json_escape() {
+    local str="$1"
+    # Escape backslashes first, then quotes, then control chars
+    str="${str//\\/\\\\}"      # \ -> \\
+    str="${str//\"/\\\"}"      # " -> \"
+    str="${str//$'\n'/\\n}"    # newline -> \n
+    str="${str//$'\r'/\\r}"    # carriage return -> \r
+    str="${str//$'\t'/\\t}"    # tab -> \t
+    printf '%s' "$str"
+}
+
+# Get current project from tmux session name or PWD
+get_current_project() {
+    if [ -n "$TMUX" ]; then
+        tmux display-message -p '#S' 2>/dev/null || basename "$PWD"
+    else
+        basename "$PWD"
+    fi
+}
+
+TARGET="$1"
+shift
+
+# Parse message type and flags
+TYPE="📨"  # default: info
+FORCE_QUEUE=false
+PROMPT_MODE=false
+FORCE_SEND=false
+START_MODE="continue"  # default: continue existing conversation
+
+while [[ "$1" == --* ]] || [[ "$1" == -* ]]; do
+    case "$1" in
+        --question|-q)
+            TYPE="❓"
+            shift
+            ;;
+        --blocked|-b)
+            TYPE="🚫"
+            shift
+            ;;
+        --completed|-c)
+            TYPE="✅"
+            shift
+            ;;
+        --queue)
+            FORCE_QUEUE=true
+            shift
+            ;;
+        --prompt|-p)
+            PROMPT_MODE=true
+            shift
+            ;;
+        --force|-f)
+            FORCE_SEND=true
+            shift
+            ;;
+        --new|-n)
+            START_MODE="new"
+            shift
+            ;;
+        --continue)
+            START_MODE="continue"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+MESSAGE="$*"
+FROM=$(get_current_project)
+
+if [ -z "$TARGET" ] || [ -z "$MESSAGE" ]; then
+    echo "Usage: msg <project> [options] \"message\"" >&2
+    echo "Options:" >&2
+    echo "  --question, -q    Mark as question (❓)" >&2
+    echo "  --blocked, -b     Mark as blocked (🚫)" >&2
+    echo "  --completed, -c   Mark as completed (✅)" >&2
+    echo "  --prompt, -p      Raw text mode (no formatting, for delegation)" >&2
+    echo "  --queue           Force queue (don't try live send)" >&2
+    echo "  --force, -f       Force send even if window active" >&2
+    echo "  --new, -n         Start fresh Claude session (with 'claude')" >&2
+    echo "  --continue        Continue existing Claude session (with 'claude -c', default)" >&2
+    echo "Examples:" >&2
+    echo "  msg tools \"Task completed\"" >&2
+    echo "  msg tools --question \"Which approach: A or B?\"" >&2
+    echo "  msg tools --prompt \"Fix the bug in X\"" >&2
+    exit 1
+fi
+
+# Find tmux session (case-insensitive, sanitized name)
+SAFE_TARGET=$(echo "$TARGET" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+
+# Format message based on mode
+if [ "$PROMPT_MODE" = true ]; then
+    FORMATTED="$MESSAGE"  # Raw text, no formatting
+else
+    FORMATTED="$TYPE [$FROM]: $MESSAGE"
+fi
+
+# Function to queue message for offline delivery
+queue_message() {
+    mkdir -p "$INBOX_DIR"
+    local inbox_file="$INBOX_DIR/$SAFE_TARGET.jsonl"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local escaped_msg=$(json_escape "$MESSAGE")
+
+    if [ "$PROMPT_MODE" = true ]; then
+        # Store as prompt for later execution
+        local json=$(printf '{"timestamp":"%s","from":"%s","type":"prompt","message":"%s","start_mode":"%s"}\n' \
+            "$timestamp" "$FROM" "$escaped_msg" "$START_MODE")
+    else
+        local json=$(printf '{"timestamp":"%s","from":"%s","type":"%s","message":"%s","start_mode":"%s"}\n' \
+            "$timestamp" "$FROM" "$TYPE" "$escaped_msg" "$START_MODE")
+    fi
+    echo "$json" >> "$inbox_file"
+    echo "Queued for $TARGET: $FORMATTED (inbox: $inbox_file)" >&2
+}
+
+# Force queue mode - skip live delivery
+if [ "$FORCE_QUEUE" = true ]; then
+    queue_message
+    exit 0
+fi
+
+# Try tmux first
+if tmux has-session -t "$SAFE_TARGET" 2>/dev/null; then
+    # Non-force mode: ensure Claude running, check if safe
+    if [ "$FORCE_SEND" != true ]; then
+        if ! ensure_claude_started "$SAFE_TARGET" "$START_MODE"; then
+            queue_message
+            echo "Queued (Claude failed to start): $FORMATTED" >&2
+            exit 0
+        fi
+        if ! is_pane_safe_to_send "$SAFE_TARGET"; then
+            queue_message
+            echo "Queued (busy/input): $FORMATTED" >&2
+            exit 0
+        fi
+    fi
+
+    # Force mode: still try to ensure Claude started
+    if [ "$FORCE_SEND" = true ]; then
+        if ! ensure_claude_started "$SAFE_TARGET" "$START_MODE"; then
+            queue_message
+            echo "Queued (Claude failed to start): $FORMATTED" >&2
+            exit 0
+        fi
+    fi
+
+    # Send text first, then Enter separately (Claude TUI needs this)
+    # Scale delay based on prompt length so paste completes before Enter
+    tmux send-keys -t "$SAFE_TARGET" "$FORMATTED"
+    PROMPT_LEN=${#FORMATTED}
+    if [ "$PROMPT_LEN" -lt 500 ]; then
+        sleep 0.2
+    elif [ "$PROMPT_LEN" -lt 2000 ]; then
+        sleep 0.5
+    else
+        sleep 1.5
+    fi
+    tmux send-keys -t "$SAFE_TARGET" Enter
+    echo "Sent (tmux) to $TARGET: $FORMATTED" >&2
+    exit 0
+fi
+
+# Fallback to iTerm profile
+APPLESCRIPT="
+tell application \"iTerm2\"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if profile name of s is \"$TARGET\" then
+                    tell s to write text \"$FORMATTED\"
+                    return true
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return false
+end tell"
+
+if osascript -e "$APPLESCRIPT" 2>/dev/null | grep -q true; then
+    echo "Sent (iTerm) to $TARGET: $FORMATTED" >&2
+    exit 0
+fi
+
+# Target offline - queue for later
+queue_message
+exit 0
