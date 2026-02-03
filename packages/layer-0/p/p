@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+Interactive project picker using fzf.
+Usage:
+  p              # Interactive picker
+  p <query>      # Pre-filter list
+  p --goto NAME  # Non-interactive: output path for NAME (for scripts)
+  p --path NAME  # Alias for --goto
+  p --current    # JSON info of project based on cwd
+  p --search Q   # Fuzzy search, returns JSON array of matches
+  p --info [N]   # JSON info (no arg=current, with arg=fuzzy search)
+  p --add [name] [path] # Register dir (uses cwd if no path)
+  p --remove     # Interactive removal (fzf)
+  p --list       # Plain list
+  p --sync       # Re-scan ~/.claude/projects/
+  p --cleanup    # Remove duplicate entries (same path, different names)
+  p --redetect   # Re-detect types for all 'unknown' entries
+  p --merge SRC DST  # Merge SRC project into DST (sessions, hours, then remove SRC)
+  p --help       # Show this help
+
+Shell functions (add to .zshrc):
+  p()  { local d; d=$(command p "$@") && [ -n "$d" ] && cd "$d"; }
+  pc() { local d; d=$(command p "$@") && [ -n "$d" ] && cd "$d" && claude -c; }
+
+Automation example:
+  cd "$(p --goto myproject)" && claude -p "run tests"
+  p --search marriage  # Find projects matching 'marriage'
+  p --current          # Get current project as JSON
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Configuration paths - can be overridden via environment variables
+REGISTRY_PATH = Path(os.environ.get('P_REGISTRY', Path.home() / ".claude" / "projects.json"))
+CLAUDE_PROJECTS = Path(os.environ.get('CLAUDE_PROJECTS', Path.home() / ".claude" / "projects"))
+WP_TEST_SITES = Path(os.environ.get('WP_TEST_SITES', Path.home() / ".wp-test" / "sites"))
+ITERM_SYNC = Path(os.environ.get('ITERM_SYNC', ''))  # Optional iTerm2 profile sync script
+
+def sync_iterm():
+    """Sync iTerm2 profiles with projects (optional, requires ITERM_SYNC env var)."""
+    if ITERM_SYNC and str(ITERM_SYNC) and Path(ITERM_SYNC).exists():
+        subprocess.run([sys.executable, str(ITERM_SYNC)], capture_output=True)
+
+
+def load_registry():
+    if REGISTRY_PATH.exists():
+        with open(REGISTRY_PATH) as f:
+            return json.load(f)
+    return {}
+
+def save_registry(registry):
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(REGISTRY_PATH, 'w') as f:
+        json.dump(registry, f, indent=2)
+
+def path_exists_in_registry(registry, path):
+    """Check if path already registered under any name."""
+    return any(info['path'] == path for info in registry.values())
+
+def cleanup_duplicates(registry):
+    """Remove entries with duplicate paths, keeping the shortest name."""
+    seen_paths = {}
+    to_remove = []
+    for name, info in sorted(registry.items()):
+        path = info['path']
+        if path in seen_paths:
+            existing_name = seen_paths[path]
+            if len(name) < len(existing_name):
+                to_remove.append(existing_name)
+                seen_paths[path] = name
+            else:
+                to_remove.append(name)
+        else:
+            seen_paths[path] = name
+    for name in to_remove:
+        del registry[name]
+    return len(to_remove)
+
+def detect_project_type(path):
+    p = Path(path)
+    if (p / "wp-config.php").exists() or (p / "wordpress").exists():
+        return "wordpress"
+    if (p / "requirements.txt").exists() or (p / "pyproject.toml").exists() or (p / ".venv").exists():
+        return "python"
+    # Check for *.py files as fallback
+    if any(p.glob("*.py")):
+        return "python"
+    if (p / "package.json").exists():
+        return "node"
+    if (p / "Cargo.toml").exists():
+        return "rust"
+    if (p / "go.mod").exists():
+        return "go"
+    return "unknown"
+
+def extract_project_name(dir_name):
+    """Extract readable name from Claude's sanitized directory name."""
+    # Format: -Users-username-Projects-myproject
+    parts = dir_name.strip('-').split('-')
+    # Find meaningful name (usually last component, skip common path segments)
+    # Get current username dynamically
+    username = os.path.basename(os.path.expanduser('~'))
+    skip = {'Users', 'home', username, 'Sites', 'Projects', 'Tools', 'wordpress',
+            'wp-content', 'plugins', 'themes', '.wp-test', 'sites', 'Documents'}
+    meaningful = [p for p in parts if p and p not in skip]
+    if meaningful:
+        return meaningful[-1].lower().replace('.', '-')
+    return parts[-1].lower() if parts else "unknown"
+
+def decode_path(dir_name):
+    """Convert Claude's sanitized directory name back to real path."""
+    # -Users-username-foo -> /Users/username/foo
+    return '/' + dir_name.strip('-').replace('-', '/')
+
+def sync_projects():
+    """Scan ~/.claude/projects/ and ~/.wp-test/sites/ to update registry."""
+    registry = load_registry()
+
+    # Scan Claude projects
+    if CLAUDE_PROJECTS.exists():
+        for dir_entry in CLAUDE_PROJECTS.iterdir():
+            if not dir_entry.is_dir() or dir_entry.name.startswith('.'):
+                continue
+
+            real_path = decode_path(dir_entry.name)
+            if not os.path.isdir(real_path):
+                continue
+
+            name = extract_project_name(dir_entry.name)
+
+            # Handle duplicates by appending parent dir
+            if name in registry and registry[name]['path'] != real_path:
+                parts = real_path.rstrip('/').split('/')
+                if len(parts) >= 2:
+                    name = f"{parts[-2]}-{name}".lower()
+
+            if name not in registry and not path_exists_in_registry(registry, real_path):
+                registry[name] = {
+                    'path': real_path,
+                    'type': detect_project_type(real_path),
+                    'added': datetime.now().isoformat()[:10],
+                    'last_accessed': datetime.now().isoformat()[:10]
+                }
+
+    # Scan wp-test sites (WordPress Docker environments)
+    if WP_TEST_SITES.exists():
+        for site_dir in WP_TEST_SITES.iterdir():
+            if not site_dir.is_dir() or site_dir.name.startswith('.'):
+                continue
+
+            # wp-test sites have wordpress/ subdirectory
+            wp_path = site_dir / "wordpress"
+            if not wp_path.exists():
+                wp_path = site_dir
+
+            # Clean name: fiverr.loc -> fiverr, level2-academy -> level2-academy
+            name = site_dir.name.replace('.loc', '').replace('.local', '')
+
+            # Avoid overwriting existing entries with same name
+            if name in registry and registry[name]['path'] != str(wp_path):
+                name = f"wp-{name}"
+
+            if name not in registry and not path_exists_in_registry(registry, str(wp_path)):
+                registry[name] = {
+                    'path': str(wp_path),
+                    'type': 'wordpress',
+                    'added': datetime.now().isoformat()[:10],
+                    'last_accessed': datetime.now().isoformat()[:10]
+                }
+
+    save_registry(registry)
+    return registry
+
+def add_project(name=None, path=None):
+    """Add directory to registry. Uses cwd if path not specified."""
+    registry = load_registry()
+    target_path = path if path else os.getcwd()
+
+    # Resolve to absolute path
+    target_path = os.path.abspath(os.path.expanduser(target_path))
+
+    if not name:
+        name = Path(target_path).name.lower().replace(' ', '-')
+
+    registry[name] = {
+        'path': target_path,
+        'type': detect_project_type(target_path),
+        'added': datetime.now().isoformat()[:10],
+        'last_accessed': datetime.now().isoformat()[:10]
+    }
+
+    save_registry(registry)
+    print(f"Added: {name} -> {target_path}", file=sys.stderr)
+    return name
+
+def format_for_fzf(registry):
+    """Format registry entries for fzf display."""
+    lines = []
+    for name, info in sorted(registry.items()):
+        path = info['path']
+        ptype = info.get('type', 'unknown')
+        # Truncate path for display
+        display_path = path if len(path) < 50 else '...' + path[-47:]
+        lines.append(f"{name:20} {ptype:10} {display_path}")
+    return '\n'.join(lines)
+
+def run_fzf(registry, query=None):
+    """Run fzf and return selected project path."""
+    fzf_input = format_for_fzf(registry)
+
+    if not fzf_input.strip():
+        print("No projects found. Run: p --sync", file=sys.stderr)
+        return None
+
+    cmd = ['fzf', '--height=40%', '--layout=reverse', '--border',
+           '--header=Projects (type to filter, Enter to select)',
+           '--preview-window=hidden']
+
+    if query:
+        cmd.extend(['--query', query])
+
+    try:
+        result = subprocess.run(cmd, input=fzf_input, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            selected_name = result.stdout.strip().split()[0]
+            if selected_name in registry:
+                # Update last accessed
+                registry[selected_name]['last_accessed'] = datetime.now().isoformat()[:10]
+                save_registry(registry)
+                return registry[selected_name]['path']
+    except FileNotFoundError:
+        print("fzf not found. Install: brew install fzf", file=sys.stderr)
+
+    return None
+
+def list_projects(registry):
+    """Print plain list of projects."""
+    for name, info in sorted(registry.items()):
+        print(f"{name}: {info['path']}")
+
+def goto_project(name):
+    """Non-interactive: get path for project by name (exact or fuzzy match)."""
+    registry = load_registry()
+    if not registry:
+        registry = sync_projects()
+
+    # Exact match first
+    if name in registry:
+        registry[name]['last_accessed'] = datetime.now().isoformat()[:10]
+        save_registry(registry)
+        return registry[name]['path']
+
+    # Fuzzy match: find projects containing the name
+    matches = [n for n in registry if name.lower() in n.lower()]
+    if len(matches) == 1:
+        registry[matches[0]]['last_accessed'] = datetime.now().isoformat()[:10]
+        save_registry(registry)
+        return registry[matches[0]]['path']
+    elif len(matches) > 1:
+        print(f"Ambiguous: {', '.join(matches)}", file=sys.stderr)
+        return None
+
+    print(f"Project not found: {name}", file=sys.stderr)
+    return None
+
+def get_current_project():
+    """Detect current project based on cwd."""
+    registry = load_registry()
+    if not registry:
+        registry = sync_projects()
+    cwd = os.getcwd()
+
+    # Find project whose path is prefix of cwd (longest match wins)
+    best_match = None
+    best_len = 0
+    for name, info in registry.items():
+        proj_path = info['path'].rstrip('/')
+        if cwd == proj_path or cwd.startswith(proj_path + '/'):
+            if len(proj_path) > best_len:
+                best_match = (name, info)
+                best_len = len(proj_path)
+    return best_match if best_match else (None, None)
+
+def search_projects(query):
+    """Fuzzy search returning all matches as list of dicts."""
+    registry = load_registry()
+    if not registry:
+        registry = sync_projects()
+
+    matches = []
+    query_lower = query.lower()
+    for name, info in sorted(registry.items()):
+        if query_lower in name.lower():
+            matches.append({"name": name, **info})
+    return matches
+
+def project_info(name=None):
+    """Get project info as JSON-serializable dict or list."""
+    if name is None:
+        proj_name, info = get_current_project()
+        if proj_name:
+            return {"name": proj_name, **info}
+        return None
+    return search_projects(name)
+
+def remove_projects():
+    """Interactive removal of projects using fzf (multi-select)."""
+    registry = load_registry()
+    if not registry:
+        print("No projects to remove.", file=sys.stderr)
+        return
+
+    # Format for fzf with multi-select
+    lines = []
+    for name, info in sorted(registry.items()):
+        path = info['path']
+        display_path = path if len(path) < 50 else '...' + path[-47:]
+        lines.append(f"{name:20} {display_path}")
+
+    fzf_input = '\n'.join(lines)
+    cmd = ['fzf', '--height=50%', '--layout=reverse', '--border', '--multi',
+           '--header=Select projects to remove (Tab=select, Enter=confirm)']
+
+    try:
+        result = subprocess.run(cmd, input=fzf_input, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            selected = result.stdout.strip().split('\n')
+            removed = 0
+            for line in selected:
+                name = line.split()[0]
+                if name in registry:
+                    del registry[name]
+                    removed += 1
+                    print(f"Removed: {name}", file=sys.stderr)
+            if removed:
+                save_registry(registry)
+                print(f"\nRemoved {removed} project(s)", file=sys.stderr)
+    except FileNotFoundError:
+        print("fzf not found. Install: brew install fzf", file=sys.stderr)
+
+HOURS_PATH = Path.home() / ".claude" / "hours.json"
+
+def merge_projects(src_name, dst_name, delete_src_dir=False):
+    """
+    Merge source project into destination:
+    1. Copy Claude sessions from src to dst
+    2. Rename hours entries from src to dst
+    3. Remove src from projects.json
+    4. Optionally delete src directory
+    5. Sync iTerm profiles
+    """
+    registry = load_registry()
+
+    if src_name not in registry:
+        print(f"Source project not found: {src_name}", file=sys.stderr)
+        return False
+    if dst_name not in registry:
+        print(f"Destination project not found: {dst_name}", file=sys.stderr)
+        return False
+
+    src_path = registry[src_name]['path']
+    dst_path = registry[dst_name]['path']
+
+    # 1. Merge Claude sessions
+    def path_to_claude_dir(path):
+        """Convert path to Claude's sanitized directory name."""
+        return path.replace('/', '-')
+
+    src_claude_dir = CLAUDE_PROJECTS / path_to_claude_dir(src_path)
+    dst_claude_dir = CLAUDE_PROJECTS / path_to_claude_dir(dst_path)
+
+    sessions_merged = 0
+    if src_claude_dir.exists() and src_claude_dir.is_dir():
+        dst_claude_dir.mkdir(parents=True, exist_ok=True)
+        for session_file in src_claude_dir.glob("*.jsonl"):
+            dst_file = dst_claude_dir / session_file.name
+            if not dst_file.exists():
+                shutil.copy2(session_file, dst_file)
+                sessions_merged += 1
+        print(f"  Sessions: merged {sessions_merged} files", file=sys.stderr)
+
+    # 2. Merge hours entries
+    hours_merged = 0
+    if HOURS_PATH.exists():
+        with open(HOURS_PATH) as f:
+            hours_data = json.load(f)
+        entries = hours_data.get('entries', [])
+        for entry in entries:
+            if entry.get('project', '').lower() == src_name.lower():
+                entry['project'] = dst_name
+                hours_merged += 1
+        with open(HOURS_PATH, 'w') as f:
+            json.dump(hours_data, f, indent=2)
+        if hours_merged:
+            print(f"  Hours: renamed {hours_merged} entries to {dst_name}", file=sys.stderr)
+
+    # 3. Remove src from registry
+    del registry[src_name]
+    save_registry(registry)
+    print(f"  Registry: removed {src_name}", file=sys.stderr)
+
+    # 4. Optionally delete directories
+    if delete_src_dir:
+        if src_claude_dir.exists():
+            shutil.rmtree(src_claude_dir)
+            print(f"  Deleted: {src_claude_dir}", file=sys.stderr)
+        if Path(src_path).exists():
+            shutil.rmtree(src_path)
+            print(f"  Deleted: {src_path}", file=sys.stderr)
+
+    # 5. Sync iTerm
+    sync_iterm()
+    print(f"  iTerm: synced", file=sys.stderr)
+
+    print(f"\n✓ Merged {src_name} → {dst_name}", file=sys.stderr)
+    return True
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Handle flags
+    if '--help' in args or '-h' in args:
+        print(__doc__, file=sys.stderr)
+        return
+
+    if '--remove' in args:
+        remove_projects()
+        return
+
+    if '--merge' in args:
+        idx = args.index('--merge')
+        remaining = args[idx + 1:]
+        if len(remaining) < 2:
+            print("Usage: p --merge SOURCE DEST [--delete]", file=sys.stderr)
+            print("  --delete  Also delete source directory", file=sys.stderr)
+            sys.exit(1)
+        src_name = remaining[0]
+        dst_name = remaining[1]
+        delete_src = '--delete' in args
+        if merge_projects(src_name, dst_name, delete_src):
+            sys.exit(0)
+        else:
+            sys.exit(1)
+        return
+
+    if '--cleanup' in args:
+        registry = load_registry()
+        removed = cleanup_duplicates(registry)
+        save_registry(registry)
+        print(f"Removed {removed} duplicate entries", file=sys.stderr)
+        return
+
+    if '--redetect' in args:
+        registry = load_registry()
+        fixed = 0
+        for name, info in registry.items():
+            if info.get('type') == 'unknown':
+                new_type = detect_project_type(info['path'])
+                if new_type != 'unknown':
+                    info['type'] = new_type
+                    fixed += 1
+                    print(f"  {name}: unknown -> {new_type}", file=sys.stderr)
+        save_registry(registry)
+        sync_iterm()
+        print(f"Fixed {fixed} project types (+ iTerm2 profiles)", file=sys.stderr)
+        return
+
+    if '--sync' in args:
+        registry = sync_projects()
+        sync_iterm()
+        print(f"Synced {len(registry)} projects (+ iTerm2 profiles)", file=sys.stderr)
+        return
+
+    if '--add' in args:
+        idx = args.index('--add')
+        remaining = args[idx + 1:]
+        name = remaining[0] if len(remaining) >= 1 else None
+        path = remaining[1] if len(remaining) >= 2 else None
+        add_project(name, path)
+        sync_iterm()
+        return
+
+    if '--list' in args:
+        registry = load_registry()
+        if not registry:
+            registry = sync_projects()
+        list_projects(registry)
+        return
+
+    if '--goto' in args or '--path' in args:
+        flag = '--goto' if '--goto' in args else '--path'
+        idx = args.index(flag)
+        if len(args) <= idx + 1:
+            print(f"Usage: p {flag} PROJECT_NAME", file=sys.stderr)
+            sys.exit(1)
+        name = args[idx + 1]
+        path = goto_project(name)
+        if path:
+            print(path)
+        else:
+            sys.exit(1)
+        return
+
+    if '--current' in args:
+        name, info = get_current_project()
+        if name:
+            print(json.dumps({"name": name, **info}, indent=2))
+        else:
+            print(json.dumps({"error": "Not in a registered project"}))
+            sys.exit(1)
+        return
+
+    if '--search' in args:
+        idx = args.index('--search')
+        if len(args) <= idx + 1:
+            print(json.dumps({"error": "Usage: p --search QUERY"}))
+            sys.exit(1)
+        query = args[idx + 1]
+        matches = search_projects(query)
+        print(json.dumps(matches, indent=2))
+        return
+
+    if '--info' in args:
+        idx = args.index('--info')
+        name = args[idx + 1] if len(args) > idx + 1 else None
+        result = project_info(name)
+        if result:
+            print(json.dumps(result, indent=2))
+        else:
+            print(json.dumps({"error": "Not in a registered project"}))
+            sys.exit(1)
+        return
+
+    # Interactive mode
+    registry = load_registry()
+    if not registry:
+        registry = sync_projects()
+
+    query = args[0] if args else None
+    path = run_fzf(registry, query)
+
+    if path:
+        print(path)  # Output path for shell function to cd
+
+if __name__ == '__main__':
+    main()
