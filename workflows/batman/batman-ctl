@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+batman-ctl - State management for Batman mode
+
+Commands:
+  init <task>     Initialize batman session with task description
+  status          Show current batman status
+  approve         Mark user_approved flag (after user says "go")
+  generate        Create prompts/*.md and apply.json from task_queue.json
+  lock            Activate execution lock
+  unlock          Remove execution lock
+  pause           Pause for manual intervention
+  resume          Resume after manual intervention
+  complete <id>   Mark a subtask as complete
+  fail <id>       Mark a subtask as failed
+  abort           Abort session, generate handoff
+  clean           Remove .batman/ directory
+
+Usage:
+  batman-ctl init "Add JWT authentication"
+  batman-ctl status
+  batman-ctl approve
+  batman-ctl generate
+  batman-ctl lock
+"""
+
+import json
+import sys
+import os
+from datetime import datetime
+from pathlib import Path
+
+BATMAN_DIR = Path(".batman")
+STATUS_FILE = BATMAN_DIR / "status.json"
+PROGRESS_FILE = BATMAN_DIR / "progress.json"
+HANDOFF_FILE = BATMAN_DIR / "handoff.md"
+TASK_QUEUE_FILE = BATMAN_DIR / "task_queue.json"
+PROMPTS_DIR = BATMAN_DIR / "prompts"
+OUTPUTS_DIR = BATMAN_DIR / "outputs"
+APPLY_FILE = BATMAN_DIR / "apply.json"
+
+# Colors
+GREEN = '\033[0;32m'
+YELLOW = '\033[0;33m'
+RED = '\033[0;31m'
+BLUE = '\033[0;34m'
+CYAN = '\033[0;36m'
+NC = '\033[0m'
+
+def init_session(task: str):
+    """Initialize a new batman session."""
+    if BATMAN_DIR.exists():
+        print(f"{YELLOW}Warning: .batman/ already exists. Use 'batman-ctl clean' first or 'batman-ctl status'.{NC}")
+        sys.exit(1)
+
+    BATMAN_DIR.mkdir(parents=True)
+    (BATMAN_DIR / "outputs").mkdir()
+
+    status = {
+        "phase": "recon",
+        "started_at": datetime.now().isoformat(),
+        "task": task,
+        "flags": {
+            "prep_complete": False,
+            "user_approved": False,
+            "lock_active": False,
+            "alfred_verified": False,
+            "alfred_result": None
+        },
+        "current_subtask": None,
+        "completed_subtasks": [],
+        "failed_subtasks": []
+    }
+
+    progress = {
+        "subtasks": {},
+        "started_at": datetime.now().isoformat(),
+        "last_updated": datetime.now().isoformat()
+    }
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(progress, f, indent=2)
+
+    print(f"{GREEN}Batman session initialized{NC}")
+    print(f"{BLUE}Task:{NC} {task}")
+    print(f"{BLUE}Phase:{NC} recon (read-only exploration)")
+    print(f"\n{CYAN}Next steps:{NC}")
+    print("1. Enter Plan Mode (Shift+Tab)")
+    print("2. Explore codebase, recall memories")
+    print("3. Write PREP.md, task_queue.json, context.json")
+    print("4. Run 'batman-ctl approve' after user approval")
+
+def show_status():
+    """Show current batman status."""
+    if not STATUS_FILE.exists():
+        print(f"{YELLOW}No batman session active.{NC}")
+        print(f"Start one with: batman-ctl init \"<task>\"")
+        sys.exit(0)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    phase = status.get("phase", "unknown")
+    flags = status.get("flags", {})
+
+    phase_colors = {
+        "recon": BLUE,
+        "approval": YELLOW,
+        "execution": GREEN,
+        "complete": GREEN,
+        "aborted": RED
+    }
+    color = phase_colors.get(phase, NC)
+
+    print(f"{CYAN}=== Batman Status ==={NC}")
+    print(f"{BLUE}Task:{NC} {status.get('task', 'unknown')}")
+    print(f"{BLUE}Phase:{NC} {color}{phase}{NC}")
+    print(f"{BLUE}Started:{NC} {status.get('started_at', 'unknown')}")
+    print()
+    print(f"{CYAN}Flags:{NC}")
+    print(f"  prep_complete:    {'✓' if flags.get('prep_complete') else '✗'}")
+    print(f"  user_approved:    {'✓' if flags.get('user_approved') else '✗'}")
+    print(f"  lock_active:      {'🔒' if flags.get('lock_active') else '🔓'}")
+    print(f"  alfred_verified:  {'✓' if flags.get('alfred_verified') else '✗'}")
+    if flags.get('alfred_result'):
+        print(f"  alfred_result:    {flags.get('alfred_result')}")
+
+    # Check for required files
+    print(f"\n{CYAN}Files:{NC}")
+    files = ["PREP.md", "task_queue.json", "context.json"]
+    for f in files:
+        exists = (BATMAN_DIR / f).exists()
+        print(f"  {f}: {'✓' if exists else '✗'}")
+
+    # Show progress if in execution
+    if phase == "execution" and PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE) as f:
+            progress = json.load(f)
+        completed = status.get("completed_subtasks", [])
+        failed = status.get("failed_subtasks", [])
+        print(f"\n{CYAN}Progress:{NC}")
+        print(f"  Completed: {len(completed)}")
+        print(f"  Failed: {len(failed)}")
+        if status.get("current_subtask"):
+            print(f"  Current: {status['current_subtask']}")
+
+def set_flag(flag: str, value: bool):
+    """Set a flag in status.json."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    status["flags"][flag] = value
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    print(f"{GREEN}Set {flag} = {value}{NC}")
+
+def set_phase(phase: str):
+    """Set the current phase."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    status["phase"] = phase
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    print(f"{GREEN}Phase set to: {phase}{NC}")
+
+def approve():
+    """Mark user approval and transition to execution-ready state."""
+    # Check prep is complete
+    required = ["PREP.md", "task_queue.json", "context.json"]
+    missing = [f for f in required if not (BATMAN_DIR / f).exists()]
+
+    if missing:
+        print(f"{RED}Cannot approve - missing files:{NC}")
+        for f in missing:
+            print(f"  - {f}")
+        sys.exit(1)
+
+    set_flag("prep_complete", True)
+    set_flag("user_approved", True)
+    set_phase("approval")
+
+    print(f"\n{GREEN}Ready for execution!{NC}")
+    print(f"Next: Exit Plan Mode, then run 'batman-ctl lock' to activate enforcement.")
+
+def generate():
+    """Generate prompts/*.md files and apply.json from task_queue.json."""
+    if not TASK_QUEUE_FILE.exists():
+        print(f"{RED}Error: task_queue.json not found in .batman/{NC}")
+        sys.exit(1)
+
+    # Read task_queue.json
+    with open(TASK_QUEUE_FILE) as f:
+        task_queue = json.load(f)
+
+    subtasks = task_queue.get("subtasks", [])
+    if not subtasks:
+        print(f"{YELLOW}Warning: No subtasks found in task_queue.json{NC}")
+        sys.exit(0)
+
+    # Create prompts directory if needed
+    PROMPTS_DIR.mkdir(exist_ok=True)
+
+    # Track apply mappings
+    apply_mappings = []
+
+    print(f"{CYAN}Generating prompts...{NC}\n")
+
+    # Generate prompt file for each subtask
+    for subtask in subtasks:
+        subtask_id = subtask.get("id")
+        description = subtask.get("description", "")
+        prompt = subtask.get("prompt", "")
+        output = subtask.get("output", "")
+        depends_on = subtask.get("depends_on", [])
+
+        # Build previous outputs section
+        if depends_on:
+            prev_outputs = "\n".join([f"- .batman/outputs/{dep}.txt" for dep in depends_on])
+        else:
+            prev_outputs = "none"
+
+        # Create prompt content
+        prompt_content = f"""# .batman/prompts/{subtask_id}.md
+
+## Permissions
+Read: ANY file
+Write: ONLY .batman/outputs/{subtask_id}.txt
+
+## Context
+Read: .batman/context.json
+
+## Previous Outputs
+{prev_outputs}
+
+## Task
+{description}
+
+## Instructions
+{prompt}
+
+## Output
+Write to: .batman/outputs/{subtask_id}.txt
+Target: {output}
+"""
+
+        # Write prompt file
+        prompt_file = PROMPTS_DIR / f"{subtask_id}.md"
+        with open(prompt_file, 'w') as f:
+            f.write(prompt_content)
+
+        # Add to apply mappings
+        apply_mappings.append({
+            "output": f".batman/outputs/{subtask_id}.txt",
+            "target": output
+        })
+
+        print(f"{GREEN}✓{NC} {subtask_id}.md")
+
+    # Create apply.json
+    apply_data = {"mappings": apply_mappings}
+    with open(APPLY_FILE, 'w') as f:
+        json.dump(apply_data, f, indent=2)
+
+    print(f"\n{GREEN}✓{NC} apply.json")
+    print(f"\n{CYAN}Summary:{NC}")
+    print(f"  Generated {len(subtasks)} prompt files")
+    print(f"  Created apply.json with {len(apply_mappings)} mappings")
+    print(f"\n{BLUE}Next:{NC} Review prompts in .batman/prompts/, then run subagents")
+
+def lock():
+    """Activate the execution lock."""
+    set_flag("lock_active", True)
+    set_phase("execution")
+    print(f"\n{GREEN}🔒 Batman lock ACTIVE{NC}")
+    print("Direct Write/Edit calls will be blocked.")
+    print("Use Task() to spawn subagents for work.")
+
+def unlock():
+    """Remove the execution lock."""
+    set_flag("lock_active", False)
+    print(f"\n{YELLOW}🔓 Batman lock removed{NC}")
+
+def pause():
+    """Pause for manual intervention."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    status["flags"]["lock_active"] = False
+    status["_paused_at"] = datetime.now().isoformat()
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    print(f"{YELLOW}Batman mode PAUSED{NC}")
+    print("You can now make manual changes.")
+    print("Run 'batman-ctl resume' when done.")
+
+def resume():
+    """Resume after manual intervention."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    if status.get("phase") == "execution":
+        status["flags"]["lock_active"] = True
+    if "_paused_at" in status:
+        del status["_paused_at"]
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    print(f"{GREEN}Batman mode RESUMED{NC}")
+
+def complete_subtask(subtask_id: str):
+    """Mark a subtask as complete."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    if subtask_id not in status["completed_subtasks"]:
+        status["completed_subtasks"].append(subtask_id)
+
+    if status.get("current_subtask") == subtask_id:
+        status["current_subtask"] = None
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    # Update progress
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE) as f:
+            progress = json.load(f)
+        progress["subtasks"][subtask_id] = {
+            "status": "complete",
+            "completed_at": datetime.now().isoformat()
+        }
+        progress["last_updated"] = datetime.now().isoformat()
+        with open(PROGRESS_FILE, 'w') as f:
+            json.dump(progress, f, indent=2)
+
+    print(f"{GREEN}✓ Subtask '{subtask_id}' marked complete{NC}")
+
+def fail_subtask(subtask_id: str):
+    """Mark a subtask as failed."""
+    if not STATUS_FILE.exists():
+        print(f"{RED}No batman session active.{NC}")
+        sys.exit(1)
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    if subtask_id not in status["failed_subtasks"]:
+        status["failed_subtasks"].append(subtask_id)
+
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+    print(f"{RED}✗ Subtask '{subtask_id}' marked failed{NC}")
+
+def generate_handoff():
+    """Generate handoff.md from current state."""
+    if not STATUS_FILE.exists():
+        return
+
+    with open(STATUS_FILE) as f:
+        status = json.load(f)
+
+    content = f"""# Batman Handoff
+
+## Task
+{status.get('task', 'Unknown')}
+
+## Status at Handoff
+- Phase: {status.get('phase', 'unknown')}
+- Started: {status.get('started_at', 'unknown')}
+- Completed subtasks: {len(status.get('completed_subtasks', []))}
+- Failed subtasks: {len(status.get('failed_subtasks', []))}
+
+## Completed Subtasks
+"""
+    for st in status.get('completed_subtasks', []):
+        content += f"- [x] {st}\n"
+
+    content += "\n## Failed Subtasks\n"
+    for st in status.get('failed_subtasks', []):
+        content += f"- [ ] {st} (FAILED)\n"
+
+    if status.get('current_subtask'):
+        content += f"\n## Current/Next Subtask\n{status['current_subtask']}\n"
+
+    content += """
+## To Resume
+```
+cd <project_directory>
+batman-ctl status  # Check current state
+batman-ctl resume  # If was paused
+# Then continue spawning subagents per task_queue.json
+```
+"""
+
+    with open(HANDOFF_FILE, 'w') as f:
+        f.write(content)
+
+    print(f"{BLUE}Handoff saved to .batman/handoff.md{NC}")
+
+def abort():
+    """Abort the session, save handoff."""
+    if not STATUS_FILE.exists():
+        print(f"{YELLOW}No batman session to abort.{NC}")
+        sys.exit(0)
+
+    generate_handoff()
+    set_flag("lock_active", False)
+    set_phase("aborted")
+
+    print(f"{RED}Batman session ABORTED{NC}")
+    print(f"Handoff saved. Clean up with 'batman-ctl clean' when ready.")
+
+def clean():
+    """Remove .batman/ directory."""
+    import shutil
+
+    if not BATMAN_DIR.exists():
+        print(f"{YELLOW}No .batman/ directory to clean.{NC}")
+        sys.exit(0)
+
+    # Check if lock is active
+    if STATUS_FILE.exists():
+        with open(STATUS_FILE) as f:
+            status = json.load(f)
+        if status.get("flags", {}).get("lock_active"):
+            print(f"{RED}Warning: Lock is still active!{NC}")
+            # Check if running interactively
+            if sys.stdin.isatty():
+                confirm = input("Remove anyway? (y/N): ")
+                if confirm.lower() != 'y':
+                    sys.exit(0)
+            else:
+                print(f"{YELLOW}Non-interactive mode - use 'batman-ctl unlock' first or force with 'batman-ctl clean --force'{NC}")
+                if "--force" not in sys.argv:
+                    sys.exit(1)
+
+    shutil.rmtree(BATMAN_DIR)
+    print(f"{GREEN}.batman/ directory removed{NC}")
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+
+    if cmd == "init":
+        if len(sys.argv) < 3:
+            print(f"{RED}Usage: batman-ctl init \"<task description>\"{NC}")
+            sys.exit(1)
+        init_session(sys.argv[2])
+    elif cmd == "status":
+        show_status()
+    elif cmd == "approve":
+        approve()
+    elif cmd == "generate":
+        generate()
+    elif cmd == "lock":
+        lock()
+    elif cmd == "unlock":
+        unlock()
+    elif cmd == "pause":
+        pause()
+    elif cmd == "resume":
+        resume()
+    elif cmd == "complete":
+        if len(sys.argv) < 3:
+            print(f"{RED}Usage: batman-ctl complete <subtask_id>{NC}")
+            sys.exit(1)
+        complete_subtask(sys.argv[2])
+    elif cmd == "fail":
+        if len(sys.argv) < 3:
+            print(f"{RED}Usage: batman-ctl fail <subtask_id>{NC}")
+            sys.exit(1)
+        fail_subtask(sys.argv[2])
+    elif cmd == "abort":
+        abort()
+    elif cmd == "clean":
+        clean()
+    else:
+        print(f"{RED}Unknown command: {cmd}{NC}")
+        print(__doc__)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
