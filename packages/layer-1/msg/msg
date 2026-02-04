@@ -10,6 +10,30 @@ set -e
 
 INBOX_DIR="$HOME/.claude/inbox"
 
+# Help flag (check before anything else)
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "msg - Inter-session messaging for Claude Code"
+    echo ""
+    echo "USAGE:"
+    echo "  msg <project> [options] \"message\""
+    echo ""
+    echo "OPTIONS:"
+    echo "  --question, -q    Mark as question"
+    echo "  --blocked, -b     Mark as blocked"
+    echo "  --completed, -c   Mark as completed"
+    echo "  --prompt, -p      Raw text mode (no formatting)"
+    echo "  --queue           Force queue (don't try live send)"
+    echo "  --force, -f       Force send even if window active"
+    echo "  --new, -n         Start fresh Claude session"
+    echo "  --continue        Continue existing session (default)"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  msg tools \"Task completed\""
+    echo "  msg tools --question \"Which approach?\""
+    echo "  msg tools --prompt \"Fix the bug\""
+    exit 0
+fi
+
 # Source shared pane detection utilities
 # PANE_STATUS can be set to override default location
 PANE_STATUS="${PANE_STATUS:-}"

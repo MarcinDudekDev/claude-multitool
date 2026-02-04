@@ -155,8 +155,33 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     TARGET="$1"
     FORMAT="${2:-human}"
 
+    # Help flag
+    if [ "$TARGET" = "--help" ] || [ "$TARGET" = "-h" ]; then
+        echo "pane-status - Detect Claude session state in tmux"
+        echo ""
+        echo "USAGE:"
+        echo "  pane-status <session> [--json]"
+        echo ""
+        echo "EXAMPLES:"
+        echo "  pane-status my-project         # Human-readable status"
+        echo "  pane-status my-project --json  # JSON output for scripts"
+        echo ""
+        echo "OUTPUT:"
+        echo "  claude_running  - Claude Code process is active"
+        echo "  claude_working  - Claude is generating (not idle)"
+        echo "  has_input       - User has typed text at prompt"
+        echo "  pane_active     - Pane has focus"
+        echo "  safe_to_send    - Safe to inject commands"
+        echo ""
+        echo "LIBRARY MODE:"
+        echo "  source pane-status"
+        echo "  is_claude_working \"session\" && echo \"busy\""
+        exit 0
+    fi
+
     if [ -z "$TARGET" ]; then
         echo "Usage: pane-status <target> [--json]" >&2
+        echo "Run 'pane-status --help' for more info" >&2
         exit 1
     fi
 

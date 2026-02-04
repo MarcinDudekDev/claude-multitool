@@ -24,6 +24,27 @@ if [ -z "$MEMORY_CLI" ] || [ ! -f "$MEMORY_CLI" ]; then
     exit 1
 fi
 
+# Help flag
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    echo "memorize - Store facts and preferences in long-term memory"
+    echo ""
+    echo "USAGE:"
+    echo "  memorize <content> [-t category] [-i importance] [-g tags]"
+    echo ""
+    echo "OPTIONS:"
+    echo "  -t, --type       Category: preference, fact, context, decision, task, solution"
+    echo "  -i, --importance Importance: 1-10 (higher = more important)"
+    echo "  -g, --tags       Comma-separated tags"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  memorize \"Use Pico.css for simple projects\""
+    echo "  memorize -t preference -i 9 \"Always test before commit\""
+    echo "  memorize -g \"auth,jwt\" \"Tokens expire in 24h\""
+    echo ""
+    echo "Memory is auto-categorized if -t not specified."
+    exit 0
+fi
+
 if [[ $# -eq 0 ]]; then
     echo "Usage: memorize <content> [-t category] [-i importance] [-g tags]"
     echo "       memorize -t preference -i 10 \"Always test before marking complete\""
