@@ -143,6 +143,7 @@ Drop these into `~/.claude/skills/` for instant Claude Code superpowers:
 | **`git-workflow`** | Token-efficient git operations |
 | **`pair-code`** | Multi-model code review |
 | **`stario`** | Python web framework (Starlette + DataStar) |
+| **`frog`** | Mikrus Frog VPS management (Alpine Linux 256MB) |
 | **`safe-ssh`** | Whitelisted SSH wrappers |
 | **`ux-reviewer`** | UX/accessibility audits |
 
