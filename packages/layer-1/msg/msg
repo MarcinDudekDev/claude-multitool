@@ -4,6 +4,7 @@
 #        msg <project> --question "need help with X"
 #        msg <project> --blocked "waiting for API key"
 #        msg <project> --prompt "raw text" (for op delegation, no formatting)
+#        msg <project> --rsvp "need X done" (request reply when done)
 #        msg <project> --queue "offline message" (queues for later)
 
 set -e
@@ -23,6 +24,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  --completed, -c   Mark as completed"
     echo "  --prompt, -p      Raw text mode (no formatting)"
     echo "  --queue           Force queue (don't try live send)"
+    echo "  --rsvp, -r        Request reply when done"
     echo "  --force, -f       Force send even if window active"
     echo "  --new, -n         Start fresh Claude session"
     echo "  --continue        Continue existing session (default)"
@@ -30,6 +32,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "EXAMPLES:"
     echo "  msg tools \"Task completed\""
     echo "  msg tools --question \"Which approach?\""
+    echo "  msg tools --rsvp \"Update shared marketing copy\""
     echo "  msg tools --prompt \"Fix the bug\""
     exit 0
 fi
@@ -76,11 +79,19 @@ get_current_project() {
 TARGET="$1"
 shift
 
+# Project name aliases (common typos/shortcuts)
+case "$(echo "$TARGET" | tr '[:upper:]' '[:lower:]')" in
+    wpmultitool) TARGET="wp-multitool" ;;
+    fixwp)       TARGET="fix-wp" ;;
+    marcin)      TARGET="marcindudek" ;;
+esac
+
 # Parse message type and flags
 TYPE="📨"  # default: info
 FORCE_QUEUE=false
 PROMPT_MODE=false
 FORCE_SEND=false
+RSVP=false  # Request reply/acknowledgment
 START_MODE="continue"  # default: continue existing conversation
 
 while [[ "$1" == --* ]] || [[ "$1" == -* ]]; do
@@ -109,6 +120,10 @@ while [[ "$1" == --* ]] || [[ "$1" == -* ]]; do
             FORCE_SEND=true
             shift
             ;;
+        --rsvp|-r)
+            RSVP=true
+            shift
+            ;;
         --new|-n)
             START_MODE="new"
             shift
@@ -132,6 +147,7 @@ if [ -z "$TARGET" ] || [ -z "$MESSAGE" ]; then
     echo "  --question, -q    Mark as question (❓)" >&2
     echo "  --blocked, -b     Mark as blocked (🚫)" >&2
     echo "  --completed, -c   Mark as completed (✅)" >&2
+    echo "  --rsvp, -r        Request reply when done" >&2
     echo "  --prompt, -p      Raw text mode (no formatting, for delegation)" >&2
     echo "  --queue           Force queue (don't try live send)" >&2
     echo "  --force, -f       Force send even if window active" >&2
@@ -140,6 +156,7 @@ if [ -z "$TARGET" ] || [ -z "$MESSAGE" ]; then
     echo "Examples:" >&2
     echo "  msg tools \"Task completed\"" >&2
     echo "  msg tools --question \"Which approach: A or B?\"" >&2
+    echo "  msg tools --rsvp \"Update shared marketing copy\"" >&2
     echo "  msg tools --prompt \"Fix the bug in X\"" >&2
     exit 1
 fi
@@ -152,6 +169,12 @@ if [ "$PROMPT_MODE" = true ]; then
     FORMATTED="$MESSAGE"  # Raw text, no formatting
 else
     FORMATTED="$TYPE [$FROM]: $MESSAGE"
+    # --rsvp: request acknowledgment/reply from recipient
+    if [ "$RSVP" = true ]; then
+        FORMATTED="$FORMATTED
+
+When done, reply: msg $FROM \"done: <one-line summary>\""
+    fi
 fi
 
 # Function to queue message for offline delivery
