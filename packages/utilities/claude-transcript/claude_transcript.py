@@ -432,6 +432,25 @@ def get_new_pairs(filepath, start_offset=0):
             if msg:
                 messages.append(msg)
                 uuid_map[msg['uuid']] = msg
+            else:
+                # Chain node (attachment/system/mode/ai-title/queue-operation...):
+                # keep a stub so find_real_user can traverse THROUGH it instead of
+                # dead-ending. Transcript format change ~2026-06-11 interleaves
+                # these into the parentUuid chain (93 per session observed).
+                stripped = line.strip()
+                if stripped and '"uuid"' in stripped:
+                    try:
+                        obj = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        obj = None
+                    if obj and obj.get('uuid') and obj['uuid'] not in uuid_map:
+                        uuid_map[obj['uuid']] = {
+                            'type': obj.get('type', 'chain'),
+                            'uuid': obj['uuid'],
+                            'parent': obj.get('parentUuid'),
+                            'content': '', 'raw_content': '',
+                            'timestamp': '', 'is_meta': True, 'usage': {},
+                        }
         new_offset = f.tell()
 
     def find_real_user(uuid, visited=None):
