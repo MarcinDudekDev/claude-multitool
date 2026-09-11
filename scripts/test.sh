@@ -159,6 +159,12 @@ for skill_dir in "$ROOT_DIR/skills/"*/; do
 done
 echo ""
 
+# Workflows tests
+echo "Workflows:"
+test_help "batman-ctl" "$ROOT_DIR/workflows/batman/batman-ctl"
+test_python_syntax "batman-ctl" "$ROOT_DIR/workflows/batman/batman-ctl"
+echo ""
+
 # Summary
 echo "═══════════════════════════════════════════════════════════"
 total=$((passed + failed + skipped))

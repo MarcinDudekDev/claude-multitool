@@ -509,6 +509,9 @@ def main():
         abort()
     elif cmd == "clean":
         clean()
+    elif cmd in ("--help", "-h", "help"):
+        print(__doc__)
+        sys.exit(0)
     else:
         print(f"{RED}Unknown command: {cmd}{NC}")
         print(__doc__)
