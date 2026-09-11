@@ -125,6 +125,7 @@ cd claude-multitool
 | **`design-compare`** | Compare mockup vs implementation |
 | **`mobile-claude`** | Access sessions from your phone |
 | **`time-tracking`** | Extract time spent from transcripts |
+| **`claude-transcript`** | Parse Claude Code transcript JSONL (metrics, chat, incremental --new) |
 
 ### Workflows
 

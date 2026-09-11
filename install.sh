@@ -135,9 +135,12 @@ install_utilities() {
 
     ln -sf "$INSTALL_DIR/packages/utilities/t/t" "$BIN_DIR/t"
     ln -sf "$INSTALL_DIR/packages/utilities/img-optimize/img-optimize" "$BIN_DIR/img-optimize"
+    ln -sf "$INSTALL_DIR/packages/utilities/claude-transcript/claude_transcript.py" "$BIN_DIR/claude_transcript.py"
+    ln -sf "$BIN_DIR/claude_transcript.py" "$BIN_DIR/claude-transcript"
 
     echo "  ✓ t (tool selector)"
     echo "  ✓ img-optimize"
+    echo "  ✓ claude-transcript (transcript parser)"
 }
 
 # Install skills

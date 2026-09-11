@@ -116,6 +116,15 @@ echo ""
 echo "Utilities:"
 test_help "t" "$ROOT_DIR/packages/utilities/t/t"
 test_help "img-optimize" "$ROOT_DIR/packages/utilities/img-optimize/img-optimize"
+test_help "claude-transcript" "$ROOT_DIR/packages/utilities/claude-transcript/claude_transcript.py"
+test_python_syntax "claude-transcript" "$ROOT_DIR/packages/utilities/claude-transcript/claude_transcript.py"
+if python3 "$ROOT_DIR/packages/utilities/claude-transcript/test_get_new_pairs_chain.py" >/dev/null 2>&1; then
+    echo -e "  ${GREEN}PASS${NC} claude-transcript unit tests"
+    passed=$((passed + 1))
+else
+    echo -e "  ${RED}FAIL${NC} claude-transcript unit tests"
+    failed=$((failed + 1))
+fi
 echo ""
 
 # Installer test
