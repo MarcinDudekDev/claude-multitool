@@ -125,6 +125,12 @@ else
     echo -e "  ${RED}FAIL${NC} claude-transcript unit tests"
     failed=$((failed + 1))
 fi
+test_help "design-compare" "$ROOT_DIR/packages/utilities/design-compare/design-compare"
+test_python_syntax "design-compare" "$ROOT_DIR/packages/utilities/design-compare/design-compare"
+test_help "h" "$ROOT_DIR/packages/utilities/time-tracking/h"
+test_python_syntax "h" "$ROOT_DIR/packages/utilities/time-tracking/h"
+test_help "time-report" "$ROOT_DIR/packages/utilities/time-tracking/time-report"
+test_bash_syntax "time-report" "$ROOT_DIR/packages/utilities/time-tracking/time-report"
 echo ""
 
 # Installer test

@@ -137,10 +137,16 @@ install_utilities() {
     ln -sf "$INSTALL_DIR/packages/utilities/img-optimize/img-optimize" "$BIN_DIR/img-optimize"
     ln -sf "$INSTALL_DIR/packages/utilities/claude-transcript/claude_transcript.py" "$BIN_DIR/claude_transcript.py"
     ln -sf "$BIN_DIR/claude_transcript.py" "$BIN_DIR/claude-transcript"
+    ln -sf "$INSTALL_DIR/packages/utilities/design-compare/design-compare" "$BIN_DIR/design-compare"
+    ln -sf "$INSTALL_DIR/packages/utilities/time-tracking/h" "$BIN_DIR/h"
+    ln -sf "$INSTALL_DIR/packages/utilities/time-tracking/time-report" "$BIN_DIR/time-report"
 
     echo "  ✓ t (tool selector)"
     echo "  ✓ img-optimize"
     echo "  ✓ claude-transcript (transcript parser)"
+    echo "  ✓ design-compare"
+    echo "  ✓ h (hours tracker)"
+    echo "  ✓ time-report"
 }
 
 # Install skills
