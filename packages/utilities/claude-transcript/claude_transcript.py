@@ -20,6 +20,7 @@ Usage as CLI:
 import fcntl
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -90,6 +91,31 @@ def parse_line(line: str) -> dict | None:
 # ============================================================================
 # Content classification — fixes context_monitor calibration
 # ============================================================================
+
+# Machine-authored envelopes that arrive as type=user but are not human prompts:
+# slash-command echoes, local-command caveats/stdout, injected reminders,
+# background-task notifications, IDE context notes. Match known wrappers ONLY —
+# a real prompt can also start with '<' (users paste HTML/XML). On 2026-08-27 the
+# blanket startswith('<') check rejected a pasted '<div ...>' first prompt and
+# made an entire session invisible to get_new_pairs: 18 text-bearing assistant
+# turns, 0 pairs even from offset 0, drift alarm.
+_MACHINE_USER_RE = re.compile(
+    r'^<(?:command-name|command-message|command-args|local-command-caveat|'
+    r'local-command-stdout|local-command-stderr|system-reminder|'
+    r'task-notification|ide_opened_file|ide_selection)(?=[\s>/])'
+)
+# Whole-content machine notes. NOT a prefix match — '[Image #1] ...' is a real
+# prompt whose text merely opens with the image marker.
+_MACHINE_USER_EXACT = frozenset({
+    '[Request interrupted by user]',
+    '[Request interrupted by user for tool use]',
+})
+
+
+def _is_machine_user_text(text: str) -> bool:
+    """True if a user message's extracted text is a machine envelope/note."""
+    return bool(_MACHINE_USER_RE.match(text)) or text in _MACHINE_USER_EXACT
+
 
 def has_text_content(entry: dict) -> bool:
     """True if an entry has actual text output (not just tool_use/thinking).
@@ -165,8 +191,11 @@ def metrics(path) -> dict:
             if msg is None:
                 continue
             if msg['type'] == 'user':
-                # Real user messages have string content, not tool_result lists
-                if isinstance(msg['raw_content'], str) and msg['content'] and not msg['is_meta']:
+                # Real user messages carry text — string content, or a block
+                # list where a text block survived (tool_result lists yield '').
+                # Command echoes / caveats / notifications are not user turns.
+                if msg['content'] and not msg['is_meta'] \
+                        and not _is_machine_user_text(msg['content']):
                     user_turns += 1
             elif msg['type'] == 'assistant':
                 if not msg['is_meta'] and has_text_content(msg):
@@ -214,7 +243,8 @@ def fast_metrics(path) -> dict:
             if msg is None:
                 continue
             if msg['type'] == 'user':
-                if isinstance(msg['raw_content'], str) and msg['content'] and not msg['is_meta']:
+                if msg['content'] and not msg['is_meta'] \
+                        and not _is_machine_user_text(msg['content']):
                     user_turns += 1
             elif msg['type'] == 'assistant':
                 if not msg['is_meta'] and has_text_content(msg):
@@ -269,14 +299,13 @@ def tail_messages(path, nbytes=50000, types=None) -> list:
 
 def _is_real_user_message(msg: dict) -> bool:
     """Check if a parsed message is a real user message (not tool_result, not meta)."""
-    if msg['type'] != 'user':
+    if msg['type'] != 'user' or msg['is_meta']:
         return False
-    if msg['is_meta']:
+    if len(msg['content']) <= 5 or _is_machine_user_text(msg['content']):
         return False
-    # Real user messages have string content with actual text
-    if isinstance(msg['raw_content'], str) and len(msg['content']) > 5:
-        return True
-    return False
+    # String content is human input; a block list is human input only when a
+    # text block survived extract_text — pure tool_result/image lists yield ''.
+    return isinstance(msg['raw_content'], (str, list))
 
 
 def recent_exchanges(path, count=3) -> list:
@@ -453,20 +482,23 @@ def get_new_pairs(filepath, start_offset=0):
                         }
         new_offset = f.tell()
 
-    def find_real_user(uuid, visited=None):
-        if visited is None:
-            visited = set()
-        if not uuid or uuid in visited:
-            return None
-        visited.add(uuid)
-        node = uuid_map.get(uuid)
-        if not node:
-            return None
-        if node['type'] == 'user':
-            if (node['content'] and not node['is_meta']
-                    and not node['content'].startswith('<')):
+    def find_real_user(uuid):
+        # Iterative, not recursive: modern chains run thousands of ancestors deep
+        # through attachment/system/mode stubs (2044 measured on a live file),
+        # which recursed straight past the interpreter limit — every sweep_one
+        # call on such a transcript raised RecursionError instead of pairing.
+        visited = set()
+        while uuid and uuid not in visited:
+            visited.add(uuid)
+            node = uuid_map.get(uuid)
+            if not node:
+                return None
+            if (node['type'] == 'user' and node['content']
+                    and not node['is_meta']
+                    and not _is_machine_user_text(node['content'])):
                 return node
-        return find_real_user(node.get('parent'), visited)
+            uuid = node.get('parent')
+        return None
 
     user_to_assistant = {}
     for msg in messages:
@@ -487,7 +519,7 @@ def stream_chat(filepath, skip_meta=False):
     """Stream all chat messages from file, merging consecutive same-type."""
     for msg in iter_messages(filepath):
         if skip_meta:
-            if msg['is_meta'] or msg['content'].startswith('<'):
+            if msg['is_meta'] or _is_machine_user_text(msg['content']):
                 continue
         if msg['content']:
             yield msg
@@ -570,9 +602,11 @@ def message_to_turn(msg: dict, tool_result_chars: int = 200) -> dict | None:
                     results.append(_truncate(content, tool_result_chars) or '(no output)')
             if results:
                 return {'type': 'tool_result', 'timestamp': ts, 'results': results}
-            return None
-        # string content = a real human message
-        if isinstance(raw, str) and msg.get('content') and not msg.get('is_meta'):
+        # Any remaining shape with surviving text is a real human message —
+        # string prompts and text+image block lists alike. tool_result-only
+        # lists and machine envelopes/notes produce no turn.
+        if msg.get('content') and not msg.get('is_meta') \
+                and not _is_machine_user_text(msg['content']):
             return {'type': 'user', 'timestamp': ts, 'text': msg['content']}
         return None
 

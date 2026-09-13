@@ -1,0 +1,21 @@
+{"type": "mode", "mode": "normal", "sessionId": "fixture-drift-0001"}
+{"type": "attachment", "uuid": "att-0001", "parentUuid": null, "attachment": "fake attachment stub"}
+{"type": "attachment", "uuid": "att-0002", "parentUuid": "att-0001", "attachment": "fake attachment stub"}
+{"type": "user", "uuid": "usr-caveat", "parentUuid": "att-0002", "isMeta": true, "timestamp": "2026-08-27T10:00:01.000Z", "message": {"role": "user", "content": "<local-command-caveat>fake caveat: synthetic text only</local-command-caveat>"}}
+{"type": "user", "uuid": "usr-cmd", "parentUuid": "usr-caveat", "isMeta": false, "timestamp": "2026-08-27T10:00:02.000Z", "message": {"role": "user", "content": "<command-name>/fake-clear</command-name>\n            <command-message>fake-clear</command-message>"}}
+{"type": "system", "uuid": "sys-0001", "parentUuid": "usr-cmd", "subtype": "local_command", "content": "<local-command-stdout></local-command-stdout>", "timestamp": "2026-08-27T10:00:03.000Z"}
+{"type": "user", "uuid": "usr-imgnote", "parentUuid": "sys-0001", "isMeta": true, "timestamp": "2026-08-27T10:00:04.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "[Image: source: /tmp/fixture-shot.png]"}]}}
+{"type": "user", "uuid": "usr-paste", "parentUuid": "usr-imgnote", "isMeta": false, "timestamp": "2026-08-27T10:00:05.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "   <section class=\"hero-badge\"><style>.badge{color:red}</style>swap this badge please</section>"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "RkFLRV9JTUFHRQ=="}}]}}
+{"type": "attachment", "uuid": "att-0003", "parentUuid": "usr-paste", "attachment": "fake attachment stub"}
+{"type": "assistant", "uuid": "asst-0001", "parentUuid": "att-0003", "timestamp": "2026-08-27T10:00:06.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "fake reply one: acknowledged the pasted markup and the badge request"}]}}
+{"type": "user", "uuid": "usr-tr1", "parentUuid": "asst-0001", "isMeta": false, "timestamp": "2026-08-27T10:00:07.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fake1", "content": "fake tool output one"}]}}
+{"type": "assistant", "uuid": "asst-0002", "parentUuid": "usr-tr1", "timestamp": "2026-08-27T10:00:08.000Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "echo fixture"}}]}}
+{"type": "attachment", "uuid": "att-0004", "parentUuid": "asst-0002", "attachment": "fake attachment stub"}
+{"type": "assistant", "uuid": "asst-0003", "parentUuid": "att-0004", "timestamp": "2026-08-27T10:00:09.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "fake reply two, longer text so it wins the per-user pairing"}]}}
+{"type": "user", "uuid": "usr-svg", "parentUuid": "asst-0003", "isMeta": false, "timestamp": "2026-08-27T10:00:10.000Z", "message": {"role": "user", "content": "<svg viewBox=\"0 0 8 8\"><rect width=\"8\" height=\"8\"/></svg> recolor this icon instead"}}
+{"type": "attachment", "uuid": "att-0005", "parentUuid": "usr-svg", "attachment": "fake attachment stub"}
+{"type": "queue-operation", "uuid": "qop-0001", "parentUuid": "att-0005", "operation": "enqueue", "timestamp": "2026-08-27T10:00:11.000Z"}
+{"type": "assistant", "uuid": "asst-0004", "parentUuid": "qop-0001", "timestamp": "2026-08-27T10:00:12.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "fake reply three: recolored the icon as asked"}]}}
+{"type": "user", "uuid": "usr-interrupt", "parentUuid": "asst-0004", "isMeta": false, "timestamp": "2026-08-27T10:00:13.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}
+{"type": "ai-title", "aiTitle": "fixture title", "sessionId": "fixture-drift-0001"}
+{"type": "last-prompt", "leafUuid": "asst-0004", "sessionId": "fixture-drift-0001"}
