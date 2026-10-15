@@ -143,7 +143,7 @@ Drop these into `~/.claude/skills/` for instant Claude Code superpowers:
 | **`datastar`** | Build reactive hypermedia UIs |
 | **`git-workflow`** | Token-efficient git operations |
 | **`pair-code`** | Multi-model code review |
-| **`stario`** | Python web framework (Starlette + DataStar) |
+| **`stario`** | Python 3.14 web framework (own asyncio server + Datastar 1.0 SSE), 4.x with 5.0 deltas |
 | **`frog`** | Mikrus Frog VPS management (Alpine Linux 256MB) |
 | **`safe-ssh`** | Whitelisted SSH wrappers |
 | **`ux-reviewer`** | UX/accessibility audits |
