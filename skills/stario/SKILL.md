@@ -25,7 +25,7 @@ HOME = Route("GET /")
 INC = Route("POST /inc")
 
 async def home(c: Context, w: Writer) -> None:
-    w.html(h.Html(
+    w.html(h.HtmlDocument(                            # h.Html has no doctype
         h.Head(ModuleScript()),                       # Datastar 1.0 from jsDelivr
         h.Body(h.Div(
             data.signals({"n": 0}),
@@ -51,6 +51,9 @@ if __name__ == "__main__":
 ```
 
 There is no CLI. `serve(bootstrap, *, config=None, tracer=None)` is the entry point.
+With `config=None` it reads `STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, etc. from
+the environment. Passing `config=` turns that off. `App()` needs a running event loop,
+so build it inside `serve` / bootstrap / async tests, never at module scope.
 
 ## Gotchas
 
@@ -66,7 +69,8 @@ There is no CLI. `serve(bootstrap, *, config=None, tracer=None)` is the entry po
 4. **`str(element)` is not HTML.** Markup is lazy tuples. Use
    `stario.markup.render(el)` in tests and snapshots. Handlers render for you.
 5. **Path params are percent-decoded before binding (security).** `/u/a%2Fb` gives
-   `c.match.params["user"] == "a/b"`. Any handler that builds a filesystem path from
+   `c.match.params["user"] == "a/b"` (4.x kept `%2F` encoded). The reverse is refused:
+   `USER.href("a/b")` raises `StarioError`. Any handler that builds a filesystem path from
    a `{param}` is a traversal sink. Validate ids at the sink, e.g. with
    `re.fullmatch(r"[\w-]+", x)`, or add middleware that 404s when a single-segment
    param contains `/` or `\`.
@@ -74,8 +78,12 @@ There is no CLI. `serve(bootstrap, *, config=None, tracer=None)` is the entry po
    bad JSON, but wrong types and deep nesting get past it and fail later as 500s.
    Check every field and return 400.
 7. **Datastar streams:** use `at.get(url, open_when_hidden=True)` for a per-tab
-   stream, or a backgrounded tab drops it. `data.init` only fires under an element
-   that has `data.signals`.
+   stream, or a backgrounded tab drops it.
+8. **Handlers must be `async def` and must write.** Sync handlers are refused at
+   registration. Returning without a response gives a 500
+   ("Handler returned without sending a response").
+9. **SSE goes first.** `SSE(w).patch_*` after `w.html/end/redirect/empty` raises
+   `StarioRuntime`.
 
 ## Handlers and routing
 
@@ -87,17 +95,22 @@ SEND = Route("POST", "/rooms/{id}/send")   # two-arg form also works
 app.add(USER, handler, middleware=[mw])
 app.use("/admin", auth_mw)             # Middleware = Callable[[Handler], Handler]
 app.not_found("/api", api_404)
-app.method_not_allowed("/api", api_405)
+app.method_not_allowed("/api", lambda allowed: api_405)   # factory: frozenset[str] -> Handler
 
 USER.href("bob", query={"tab": "x"})   # -> /u/bob?tab=x ; there is no url_for
+TENANT = Route("GET //{tenant}.example.com/")   # host routing; also Route(..., host=)
 ```
 
 In a handler: `c.match.params["user"]`, `c.req.query.get("q")`, `await c.req.body()`,
-`c.state` (per-request dict), and `c.app`. `c.disconnected` and `c.closing` report
-the client and server state.
+`c.state` (per-request dict), `c.req.cookies`, and `c.app`. `c.disconnected` and
+`c.closing` report the client and server state. Bodies over 10 MB (`RequestPolicy`)
+or stalled uploads raise `RequestBodyError`, answered as 413/408 if uncaught.
+Cookies: `stario.cookies.set_cookie(w, name, value, httponly=True, ...)` /
+`delete_cookie`. Background work: `app.create_task(coro)` (drained on shutdown;
+a bare `asyncio.create_task` is not).
 
 Responses go through `w`: `html(content, status)`, `text`, `json`,
-`redirect(url, 307)`, `empty(204)`, and `respond(body, content_type, status)`. For
+`redirect(url, 307)` (target must be `/absolute` or `http(s)://`), `empty(204)`, and `respond(body, content_type, status)`. For
 streaming, use `write_headers(status)` + `write(bytes)` + `end()`. Writes on a
 closed connection are silent no-ops.
 
@@ -128,7 +141,7 @@ sse.patch_elements(h.Div({"id": "out"}, "hi"), selector="#out", mode="outer")
 sse.remove("#toast"); sse.navigate("/done"); sse.execute_script("console.log(1)")
 ```
 
-`mode` is one of `outer | inner | prepend | append | before | after`. Signal keys are
+`mode` is one of `outer | inner | replace | prepend | append | before | after`. Signal keys are
 snake_case with no `$`. Hold a stream open until the client leaves with
 `async for ev in c.alive(source): ...`, which cancels the task on disconnect or
 shutdown.
@@ -155,7 +168,8 @@ assets.href("app.css")                  # -> /static/app.<hash>.css
 uploads = Files("uploads", "/uploads")  # live files: ETag + Range
 ```
 
-Hidden files are excluded unless `include_hidden=True`.
+Hidden files are excluded unless `include_hidden=True`. `Assets` checks the directory
+at construction and `href()` raises for a missing file; `Files` checks at `attach()`.
 
 ## Testing
 
@@ -175,11 +189,10 @@ async def test_inc():
 
 | 4.x | 5.x |
 |---|---|
-| `stario serve main:bootstrap`, `STARIO_*` env | `asyncio.run(serve(bootstrap, config=ServerConfig(...)))` |
+| `stario serve main:bootstrap` | `asyncio.run(serve(bootstrap))` (`STARIO_*` env or `config=ServerConfig(...)`) |
 | `import stario.responses as responses; responses.html(w, x)` | `w.html(x)` |
 | `Route.get("/x")` | `Route("GET /x")` |
 | `AssetManifest` + `StaticAssets(...).register(app)` | `await Assets(dir, prefix).attach(app)` |
 | `HttpException`, `App.on_error` | app exception + `catch_errors(...)` |
-| `{param}` kept `%2F` encoded | decoded to `/`: re-audit filesystem sinks (gotcha 5) |
 | `w._transport.get_write_buffer_size()` polling | `await w.drain()` |
 | `from stario.markup import html as h` | still works; `from stario import h` is shorter |
